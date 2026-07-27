@@ -224,6 +224,8 @@ pub fn signal_drop() {
         if let Ok(mut released) = session.released.lock() {
             *released = true;
         }
+    } else {
+        log::warn!("native drag drop signalled with no session in flight");
     }
     // The synthetic button-up both balances the start-of-drag down and wakes
     // DoDragDrop's QueryContinueDrag so it observes the released flag.
@@ -325,7 +327,22 @@ fn run_drag_thread(session: Arc<DragSession>) {
         .into();
 
         let mut effect = DROPEFFECT::default();
-        let _ = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
+        let result = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
+        // The single most useful line when a drag "does nothing" on real
+        // hardware: DRAGDROP_S_DROP means a target took it, DRAGDROP_S_CANCEL
+        // means the loop ended without one, anything else is an OLE failure.
+        log::info!(
+            "native drag session ended: {} (hr=0x{:08X}, effect=0x{:X})",
+            if result == DRAGDROP_S_DROP {
+                "dropped"
+            } else if result == DRAGDROP_S_CANCEL {
+                "cancelled"
+            } else {
+                "failed"
+            },
+            result.0,
+            effect.0
+        );
 
         // Release the synthetic button (injected drags only — a physical drag's
         // button belongs to the user and is already up, which is why DoDragDrop

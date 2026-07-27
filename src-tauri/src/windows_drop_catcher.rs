@@ -1,7 +1,8 @@
-//! Edge drop catcher for Windows→remote file drags (ShareMouse-style).
+//! OLE drop catcher used for both directions of a cross-screen file drag.
 //!
-//! This Windows machine is the controller. When the user drags files toward a
-//! screen edge that borders a controlled machine, we must read the drag payload
+//! CONTROLLER SIDE (this machine drives the cursor). When the user drags files
+//! toward a screen edge that borders a controlled machine, we must read the
+//! drag payload
 //! — but a source app's in-progress OLE drag can't be read from a global hook,
 //! and once the cursor "crosses" to the remote the capture hook swallows the
 //! mouse events the source app's `DoDragDrop` needs, so it never delivers a drop
@@ -17,6 +18,14 @@
 //!   3. The capture hook sees the hand-off flag and crosses for real, so the
 //!      cursor slides onto the remote screen.
 //!
+//! CONTROLLED SIDE (a remote controller drives our cursor). The user drags on
+//! this machine with the controller's injected input, then crosses back to the
+//! controller's own screen. The controller sends a drag-control "pull" and
+//! `handoff_to_controller` runs the same read-at-DragEnter path, except the
+//! cursor has already stopped moving here — so the catcher parks under the
+//! cursor and nudges the pointer to force one more OLE hit-test. The files then
+//! transfer to the controller, which places them where its button is released.
+//!
 //! NOTE: type-checked for the Windows target (cargo xwin) but NOT exercised on
 //! Windows hardware. The DragEnter→transfer→Escape→cross timing is the part that
 //! needs on-device verification; every step logs so a single real drag pinpoints
@@ -27,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, Ref, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINTL, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, POINTL, WPARAM};
 use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -38,9 +47,10 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, RegisterClassW,
-    SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_APP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW,
+    RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
+    SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 // The drop-target box is ~invisible-brief but must be a real, non-transparent,
@@ -55,7 +65,7 @@ const WM_DISARM: u32 = WM_APP + 2;
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT,
 };
 
 /// Called with `(device_id, files)` when a drag's files are read at the edge.
@@ -70,6 +80,11 @@ static HANDOFF: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 // shuttling the cursor back and forth across the edge can't read + transfer the
 // same drag again (each round used to make another copy). Reset on button-up.
 static HOLD_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Set while this machine is the CONTROLLED one handing its drag to a remote
+// controller. The hand-off flag is meaningless then (only a controller's
+// capture hook consumes it), so DragEnter must not leave one behind.
+static RELAY_TO_CONTROLLER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// True while the current button hold has already handed off one drag; the
 /// capture hook then skips re-arming so no duplicate transfer happens.
@@ -142,6 +157,43 @@ pub fn arm(device_id: &str, x: i32, y: i32) {
         let _ = PostMessageW(Some(hwnd), WM_ARM, wparam, lparam);
     }
     log::info!("edge catcher: armed at ({x},{y}) for {device_id}");
+}
+
+/// A controller crossed back to its own screen mid-drag and sent a drag-control
+/// "pull": hand it the file drag in flight on this (controlled) machine.
+///
+/// Same read-at-DragEnter path as the controller-side edge flow, with one
+/// difference — the controller has stopped driving our cursor, so no further
+/// mouse movement will ever reach the source app's modal `DoDragDrop` loop and
+/// DragEnter would never fire. Parking the catcher under the cursor and nudging
+/// the pointer (see `WM_ARM`) forces the one extra hit-test that lands the drag
+/// on us.
+pub fn handoff_to_controller(controller_device_id: &str) {
+    // Every pull is a fresh handshake. `reset_hold` only ever runs in the
+    // capture hook, which is not active on a controlled machine, so without
+    // this the first hand-off would block every later one.
+    reset_hold();
+    RELAY_TO_CONTROLLER.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_err() {
+        log::warn!("drag handoff: GetCursorPos failed");
+        return;
+    }
+    log::info!("drag handoff: pull from {controller_device_id}, arming under the cursor");
+    arm(controller_device_id, point.x, point.y);
+
+    // A held button is not necessarily a file drag — it could be a window drag
+    // or a text selection, in which case DragEnter never fires and the catcher
+    // would sit parked on screen forever (nothing here retracts it: DragLeave
+    // needs a drag, and no capture hook runs on a controlled machine). Retract
+    // it once the nudge has had its chance.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if RELAY_TO_CONTROLLER.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("drag handoff: no file drag under the cursor, retracting");
+            disarm();
+        }
+    });
 }
 
 /// Hide the catcher (control crossed, or the drag ended).
@@ -241,6 +293,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 );
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             }
+            // Only the controlled side needs a nudge: nothing is moving its
+            // cursor, so without one OLE never hit-tests the window we just
+            // showed and DragEnter can't fire. On the controller the user's own
+            // motion does that, and injecting moves there would feed synthetic
+            // events straight back into the capture hook.
+            if RELAY_TO_CONTROLLER.load(std::sync::atomic::Ordering::Relaxed) {
+                nudge_cursor();
+            }
             LRESULT(0)
         }
         WM_DISARM => {
@@ -305,7 +365,12 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
         // the hand-off, so Windows doesn't come back stuck in a drag state.
         inject_end_drag();
         // Tell the capture hook to cross so the cursor slides onto the remote.
-        if let Ok(mut slot) = handoff_slot().lock() {
+        // Handing a drag UP to a controller is the opposite case: the cursor is
+        // already back on that machine and no capture hook runs here to consume
+        // the flag, so setting one would only strand a stale value.
+        if RELAY_TO_CONTROLLER.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("drag handoff: files sent up to the controller");
+        } else if let Ok(mut slot) = handoff_slot().lock() {
             *slot = Some(device_id);
         }
         disarm();
@@ -417,6 +482,35 @@ fn inject_end_drag() {
             inputs.as_mut_ptr(),
             std::mem::size_of::<INPUT>() as i32,
         );
+    }
+}
+
+/// One pixel right then back. A relative move is what makes OLE's drag loop
+/// hit-test again; the pair leaves the cursor where it was.
+fn nudge_cursor() {
+    let mut inputs = [move_input(1, 0), move_input(-1, 0)];
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_mut_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
+fn move_input(dx: i32, dy: i32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
     }
 }
 

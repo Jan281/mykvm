@@ -882,7 +882,7 @@ fn start_platform_capture(
             local_y_bounds,
             display_snapshots,
             drag_count_at_left_down: std::sync::atomic::AtomicI64::new(
-                macos_drag_pasteboard::change_count(),
+                macos_appkit::change_count(),
             ),
             pending_edge_drop: Mutex::new(None),
         });
@@ -2720,6 +2720,35 @@ fn release_remote_buttons(
     }
 }
 
+/// Crossing back to this Mac with the remote left button still held: ask the
+/// controlled machine to hand over whatever file drag it has, so the drag can
+/// finish here (its files stream in and land where the button is released).
+///
+/// Clears LEFT afterwards so the button-up that `release_held_remote_inputs_macos`
+/// would send can't reach the far side and drop the drag THERE before the
+/// handoff has read it — the controlled machine releases the button itself.
+/// Must therefore run before that release. Mirrors the Windows-controller side
+/// in `handle_windows_mouse_move`.
+#[cfg(target_os = "macos")]
+fn pull_remote_drag_on_return(context: &MacCaptureContext, target: &InputTarget) {
+    if context.remote_button_mask.load(Ordering::Relaxed) & LEFT_BUTTON_MASK == 0 {
+        return;
+    }
+    crate::send_drag_pull(
+        &context.quic_transport,
+        target.origin_device_id.clone(),
+        target.device_id.clone(),
+        target.target_addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+        target.cluster_id.clone(),
+        target.pair_secret.clone(),
+    );
+    context
+        .remote_button_mask
+        .fetch_and(!LEFT_BUTTON_MASK, Ordering::Relaxed);
+}
+
 /// Releases everything we are currently holding down on the remote — forwarded
 /// modifier keys and mouse buttons — so crossing back to the local machine can
 /// never leave a stuck Ctrl/Cmd/Shift or pressed button on the controlled side.
@@ -3212,7 +3241,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             // left-up that would drop the drag on the far side before the
             // handoff reads it (the receiver releases the button itself).
             if context.remote_button_mask.load(Ordering::Relaxed) & LEFT_BUTTON_MASK != 0 {
-                crate::send_drag_pull_to_mac(
+                crate::send_drag_pull(
                     &context.quic_transport,
                     target.origin_device_id.clone(),
                     target.device_id.clone(),
@@ -3620,7 +3649,20 @@ fn handle_macos_event(
         if matches!(event_type, CGEventType::LeftMouseDown) {
             context
                 .drag_count_at_left_down
-                .store(macos_drag_pasteboard::change_count(), Ordering::Relaxed);
+                .store(macos_appkit::change_count(), Ordering::Relaxed);
+        }
+        // Releasing a drag that was pulled off a controlled machine: the files
+        // are staged here, so place them in the folder under the cursor. Same
+        // handling as the receiver path in `inject_mouse_button`, but this is
+        // the controller's own physical button, which never goes through
+        // injection. The Finder query spawns osascript — keep it off the tap
+        // thread, a slow callback gets the tap disabled.
+        if matches!(event_type, CGEventType::LeftMouseUp) && crate::drag_place::is_active() {
+            let location = event.location();
+            thread::spawn(move || {
+                let folder = macos_folder_under_cursor(location.x, location.y);
+                crate::drag_place::release(folder);
+            });
         }
         return handle_macos_modifier_event(context, event_type, event);
     };
@@ -3790,6 +3832,9 @@ fn handle_macos_mouse_move(
                 if let Ok(mut last_return) = context.last_return.lock() {
                     *last_return = Some(Instant::now());
                 }
+                // Crossed back mid-drag: pull the controlled machine's drag here
+                // (must precede the button release below).
+                pull_remote_drag_on_return(context, &target);
                 // Keep the clipboard peer so copies still sync after returning.
                 release_held_remote_inputs_macos(context, &target);
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
@@ -3882,6 +3927,7 @@ fn handle_macos_mouse_move(
             local_anchor_point(&active_target),
             active_target.invert_y,
         );
+        dismiss_macos_dock_ui_if_up();
         set_macos_cursor_decoupled(true);
         set_macos_warp_suppression_interval(0.0);
         // Hide BEFORE the anchor warp: when MyKVM is hidden/minimized it runs as a
@@ -3985,6 +4031,10 @@ struct PendingEdgeDrop {
     device_id: String,
     files: Vec<std::path::PathBuf>,
     ole: bool,
+    /// Client→client relay: the files are not a local Finder drag but the ones
+    /// pulled off another controlled machine and still streaming into the
+    /// staging dir, so they are collected at the release, not now.
+    relay: bool,
 }
 
 /// kCGEventSourceUserData magic stamped on events this process posts for
@@ -3992,6 +4042,21 @@ struct PendingEdgeDrop {
 /// forwarding them to the remote.
 #[cfg(target_os = "macos")]
 const MACOS_SELF_EVENT_MARKER: i64 = 0x4D59_4B56; // "MYKV"
+
+/// Mission Control, App Exposé and Launchpad are Dock UI that the WindowServer
+/// drives straight off the trackpad's HID stream, so the gesture tap can't
+/// suppress the swipe that opens them. While one is up the Dock owns the
+/// pointer: it undoes `CGAssociateMouseAndMouseCursorPosition(false)` and
+/// paints over the transparent cursor, so the local pointer visibly tracks the
+/// remote one. Escape dismisses it — do that before we hide and pin.
+#[cfg(target_os = "macos")]
+fn dismiss_macos_dock_ui_if_up() {
+    if !macos_appkit::frontmost_is_dock() {
+        return;
+    }
+    log::info!("dismissing Dock UI (Mission Control / Launchpad) before crossing to the remote");
+    post_marked_escape_key();
+}
 
 /// Cancels the in-flight local drag session (Escape is the native drag
 /// cancel), so Finder's drag doesn't stay stuck mid-air while the pointer
@@ -4030,12 +4095,36 @@ fn capture_edge_drag_files(context: &MacCaptureContext, active_target: &ActiveTa
         return;
     }
 
+    // Client→client relay. The files under this drag were just pulled off
+    // ANOTHER controlled machine and are staging locally, so there is no local
+    // Finder drag to read — the pasteboard check below would find nothing.
+    // Collect them at the release instead of now, because they are still
+    // streaming in.
+    //
+    // ponytail: relayed files land on the far machine's Desktop via the
+    // transfer path, not as a native drag — a native drag needs every file
+    // complete at crossing time, which would mean stalling the cursor at the
+    // edge until the inbound transfer finishes.
+    if crate::drag_place::is_relaying() {
+        let device_id = active_target.target.device_id.clone();
+        log::info!("edge drag-drop relay armed: staged files -> {device_id}");
+        if let Ok(mut pending) = context.pending_edge_drop.lock() {
+            *pending = Some(PendingEdgeDrop {
+                device_id,
+                files: Vec::new(),
+                ole: false,
+                relay: true,
+            });
+        }
+        return;
+    }
+
     // The drag pasteboard keeps the items of the PREVIOUS drag after it ends,
     // so "non-empty" alone would false-positive on a plain button hold (window
     // drag, text selection). Only a changeCount bump since this left-button
     // press proves a fresh drag session.
     let at_press = context.drag_count_at_left_down.load(Ordering::Relaxed);
-    let current = macos_drag_pasteboard::change_count();
+    let current = macos_appkit::change_count();
     if current == at_press {
         return;
     }
@@ -4046,7 +4135,7 @@ fn capture_edge_drag_files(context: &MacCaptureContext, active_target: &ActiveTa
         .drag_count_at_left_down
         .store(current, Ordering::Relaxed);
 
-    let files = macos_drag_pasteboard::file_paths();
+    let files = macos_appkit::file_paths();
     if files.is_empty() {
         return; // dragging something that isn't files (text, an image, …)
     }
@@ -4077,6 +4166,7 @@ fn capture_edge_drag_files(context: &MacCaptureContext, active_target: &ActiveTa
             device_id,
             files,
             ole,
+            relay: false,
         });
     }
     post_marked_escape_key();
@@ -4092,6 +4182,29 @@ fn fire_pending_edge_drop(context: &MacCaptureContext) {
     let Some(pending) = pending else {
         return;
     };
+    if pending.relay {
+        // Whatever finished streaming in from the first machine goes on to the
+        // second one. Files still in flight are dropped, with a count in the
+        // log — the transfer has had the whole traverse of this screen to land.
+        let files = crate::drag_place::take_staged_for_relay();
+        if files.is_empty() {
+            log::warn!(
+                "edge drag-drop relay to {}: nothing had finished transferring yet",
+                pending.device_id
+            );
+            return;
+        }
+        log::info!(
+            "edge drag-drop relay: forwarding {} file(s) to {}",
+            files.len(),
+            pending.device_id
+        );
+        emit_edge_drag(EdgeDragEvent::Transfer {
+            device_id: pending.device_id,
+            files,
+        });
+        return;
+    }
     if pending.ole {
         emit_edge_drag(EdgeDragEvent::DropOle {
             device_id: pending.device_id,
@@ -4140,11 +4253,11 @@ static MACOS_RECEIVER_DRAG_COUNT_AT_DOWN: std::sync::atomic::AtomicI64 =
 pub fn receiver_handoff_drag(controller_device_id: String) {
     let (x, y) = unpack_remote_position(REMOTE_MOUSE_POSITION.load(Ordering::Relaxed));
     let at_down = MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.load(Ordering::Relaxed);
-    let current = macos_drag_pasteboard::change_count();
+    let current = macos_appkit::change_count();
     if current != at_down {
         // Swallow these items so a re-cross during the same hold can't resend.
         MACOS_RECEIVER_DRAG_COUNT_AT_DOWN.store(current, Ordering::Relaxed);
-        let files = macos_drag_pasteboard::file_paths();
+        let files = macos_appkit::file_paths();
         if !files.is_empty() {
             log::info!(
                 "receiver drag handoff: {} file(s) -> {controller_device_id}",
@@ -4163,13 +4276,13 @@ pub fn receiver_handoff_drag(controller_device_id: String) {
     inject_mouse_button(MouseButton::Left, false, x, y);
 }
 
-/// Raw-objc access to the macOS drag pasteboard ("Apple CFPasteboard drag",
-/// the value of NSPasteboardNameDrag). Every entry point pushes an
-/// autorelease pool — AppKit calls without one from a non-main thread leak
-/// autoreleased objects and eventually crash (see the clipboard SIGSEGV
-/// history). Only ever called from the capture tap thread.
+/// Raw-objc AppKit queries made from the capture tap thread: the drag
+/// pasteboard ("Apple CFPasteboard drag", the value of NSPasteboardNameDrag)
+/// and the frontmost app. Every entry point pushes an autorelease pool —
+/// AppKit calls without one from a non-main thread leak autoreleased objects
+/// and eventually crash (see the clipboard SIGSEGV history).
 #[cfg(target_os = "macos")]
-mod macos_drag_pasteboard {
+mod macos_appkit {
     use std::ffi::{c_void, CStr, CString};
     use std::os::raw::c_char;
     use std::path::PathBuf;
@@ -4308,6 +4421,36 @@ mod macos_drag_pasteboard {
             }
         }
         paths
+    }
+
+    /// True while Mission Control, App Exposé, Launchpad or the Spaces strip is
+    /// up: those are all Dock UI, and the Dock is only ever frontmost while one
+    /// of them is showing.
+    pub fn frontmost_is_dock() -> bool {
+        unsafe {
+            let _pool = PoolGuard(objc_autoreleasePoolPush());
+            let class = objc_getClass(b"NSWorkspace\0".as_ptr() as *const c_char);
+            if class.is_null() {
+                return false;
+            }
+            let workspace = msg_obj(class, sel(b"sharedWorkspace\0"));
+            if workspace.is_null() {
+                return false;
+            }
+            let app = msg_obj(workspace, sel(b"frontmostApplication\0"));
+            if app.is_null() {
+                return false;
+            }
+            let bundle_id = msg_obj(app, sel(b"bundleIdentifier\0"));
+            if bundle_id.is_null() {
+                return false;
+            }
+            let utf8 = msg_obj(bundle_id, sel(b"UTF8String\0")) as *const c_char;
+            if utf8.is_null() {
+                return false;
+            }
+            CStr::from_ptr(utf8).to_str() == Ok("com.apple.dock")
+        }
     }
 }
 
@@ -4738,8 +4881,10 @@ fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
 /// hot corners fire on pointer position alone, so the far-corner park
 /// triggered actions like "Show all applications" on every single handoff.
 ///
-/// Controlled Windows (and anything else): keep the long-standing far-corner
-/// park unchanged.
+/// Controlled Windows (and anything else): the right edge clips the arrow the
+/// same way, so park there at the exit height. The old bottom-right corner sat
+/// exactly on the taskbar's "show desktop" strip — hovering it peeks the
+/// desktop on every handoff — and the whole bottom edge is the taskbar.
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn send_remote_cursor_park(
     quic_transport: &quic_transport::TransportHandle,
@@ -4770,13 +4915,6 @@ const PARK_CORNER_CLEARANCE: i32 = 64;
 fn remote_park_point(active: &ActiveTarget) -> (i32, i32) {
     let width = active.current_screen.width;
     let height = active.current_screen.height;
-    if !active.target.target_platform.eq_ignore_ascii_case("macos") {
-        return ((width - 1).max(0), (height - 1).max(0));
-    }
-
-    // `edge` is the LOCAL screen edge crossed to enter the remote, so this
-    // machine sits on the OPPOSITE side of the controlled screen. Pick the
-    // clipping edge (right/bottom) closest to that side.
     let clear = |position: i32, extent: i32| {
         position.clamp(
             PARK_CORNER_CLEARANCE.min((extent / 2).max(0)),
@@ -4785,6 +4923,15 @@ fn remote_park_point(active: &ActiveTarget) -> (i32, i32) {
     };
     let x = active.x.round() as i32;
     let y = active.y.round() as i32;
+    if !active.target.target_platform.eq_ignore_ascii_case("macos") {
+        // Right edge, clear of both corners: the bottom-right one is the
+        // "show desktop" strip and the bottom edge is the taskbar.
+        return ((width - 1).max(0), clear(y, height));
+    }
+
+    // `edge` is the LOCAL screen edge crossed to enter the remote, so this
+    // machine sits on the OPPOSITE side of the controlled screen. Pick the
+    // clipping edge (right/bottom) closest to that side.
     match active.target.edge {
         // This machine is west of the Mac: bottom edge, west end.
         Edge::Right => (clear(0, width), (height - 1).max(0)),
@@ -4828,6 +4975,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         }
         return;
     }
+    dismiss_macos_dock_ui_if_up();
     set_macos_cursor_decoupled(true);
     set_macos_warp_suppression_interval(0.0);
     hide_macos_cursor_if_needed(context);
@@ -4888,6 +5036,7 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     if let Ok(mut last_return) = context.last_return.lock() {
         *last_return = Some(Instant::now());
     }
+    pull_remote_drag_on_return(context, &target);
     release_held_remote_inputs_macos(context, &target);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reset_cursor_repin_timer(context);
@@ -6526,7 +6675,7 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     // bumped) from a plain hold that would ship the previous drag's stale items.
     if down && matches!(button, MouseButton::Left) {
         MACOS_RECEIVER_DRAG_COUNT_AT_DOWN
-            .store(macos_drag_pasteboard::change_count(), Ordering::Relaxed);
+            .store(macos_appkit::change_count(), Ordering::Relaxed);
     }
 
     // ShareMouse-style drag release: a staged Windows→Mac drag drops into the
@@ -7423,7 +7572,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_park_point_tucks_mac_at_shared_edge_and_keeps_windows_corner() {
+    fn remote_park_point_tucks_at_a_clipping_edge_clear_of_the_corners() {
         let target = target_for_coordinate_tests(); // edge=Right, platform=windows, remote 2560x1440
         let remote = target.remote_screen.clone();
         let mut active = ActiveTarget {
@@ -7435,8 +7584,15 @@ mod tests {
             invert_y: false,
         };
 
-        // Controlled Windows keeps the long-standing far-corner park.
-        assert_eq!(remote_park_point(&active), (2559, 1439));
+        // Controlled Windows: right edge at the exit height, never the
+        // bottom-right "show desktop" strip or the taskbar along the bottom.
+        assert_eq!(remote_park_point(&active), (2559, 700));
+        active.y = 1439.0;
+        assert_eq!(
+            remote_park_point(&active),
+            (2559, 1439 - PARK_CORNER_CLEARANCE)
+        );
+        active.y = 700.0;
 
         // Controlled macOS entered through OUR right edge (this machine sits
         // to its west): bottom clipping edge, west end, clear of the corner.

@@ -3111,19 +3111,24 @@ pub fn run() {
                         };
                         match event {
                             input::EdgeDragEvent::StartOle { device_id, files } => {
-                                if let Err(error) =
-                                    send_ole_drag_start(state, &device_id, &to_paths(files))
-                                {
-                                    log::warn!("native drag start failed: {error}");
+                                match send_ole_drag_start(state, &device_id, &to_paths(files)) {
+                                    Ok(count) => log::info!(
+                                        "native drag start sent: {count} file(s) streamed to {device_id}"
+                                    ),
+                                    Err(error) => log::warn!("native drag start failed: {error}"),
                                 }
                             }
                             input::EdgeDragEvent::DropOle { device_id } => {
-                                if let Err(error) = send_ole_drag_signal(state, &device_id, "drop") {
-                                    log::warn!("native drag drop failed: {error}");
+                                match send_ole_drag_signal(state, &device_id, "drop") {
+                                    Ok(()) => log::info!("native drag drop sent to {device_id}"),
+                                    Err(error) => log::warn!("native drag drop failed: {error}"),
                                 }
                             }
                             input::EdgeDragEvent::CancelOle { device_id } => {
-                                let _ = send_ole_drag_signal(state, &device_id, "cancel");
+                                if let Err(error) = send_ole_drag_signal(state, &device_id, "cancel")
+                                {
+                                    log::warn!("native drag cancel failed: {error}");
+                                }
                             }
                             input::EdgeDragEvent::Transfer { device_id, files } => {
                                 match send_files_to_device_inner(
@@ -5766,12 +5771,12 @@ fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Resu
         .map_err(|error| format!("拖放控制失败: {error}"))
 }
 
-/// Windows controller: ask the controlled macOS machine to hand its in-flight
-/// file drag back to us as a native OLE drag. Sent when the cursor crosses back
-/// to Windows mid-drag. Fire-and-forget on a thread so the input hot path never
+/// Controller (either platform): ask the controlled machine to hand its
+/// in-flight file drag back to us. Sent when the cursor crosses back to the
+/// controller mid-drag. Fire-and-forget on a thread so the input hot path never
 /// blocks on the round-trip.
-#[cfg(target_os = "windows")]
-pub(crate) fn send_drag_pull_to_mac(
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn send_drag_pull(
     quic_transport: &quic_transport::TransportHandle,
     origin_id: String,
     target_device_id: String,
@@ -5869,6 +5874,9 @@ fn handle_drag_control_packet(
             }
             "drop" => windows_drag::signal_drop(),
             "cancel" => windows_drag::cancel_session(),
+            // The controller crossed back to itself mid-drag and wants the file
+            // drag we are holding; the catcher reads it and transfers it up.
+            "pull" => windows_drop_catcher::handoff_to_controller(&packet.origin_id),
             _ => {}
         }
     }
@@ -5991,6 +5999,36 @@ mod drag_place {
         for path in staged {
             place(&path, &target);
         }
+    }
+
+    /// Whether a pulled drag is genuinely still in the user's hand, i.e. it can
+    /// be relayed onward to another machine. Stricter than `is_active`, whose
+    /// grace window stays true for seconds AFTER a release so late-arriving
+    /// files still get placed — crossing within that window must not be
+    /// mistaken for a relay.
+    pub fn is_relaying() -> bool {
+        state().lock().map(|state| state.active).unwrap_or(false)
+    }
+
+    /// Client→client relay: take the files that finished streaming in and end
+    /// the local placement — they belong to the next machine now.
+    ///
+    /// ponytail: files still in flight when the drag is released on the far
+    /// machine are left in the staging dir and cleared by the next `begin`.
+    /// Carrying them over would mean tracking the inbound transfer's file count,
+    /// which the drag-control packet does not carry for this direction.
+    pub fn take_staged_for_relay() -> Vec<PathBuf> {
+        let staged = {
+            let Ok(mut state) = state().lock() else {
+                return Vec::new();
+            };
+            state.active = false;
+            state.target = None;
+            state.target_at = None;
+            std::mem::take(&mut state.staged)
+        };
+        crate::input::drag_overlay_hide();
+        staged
     }
 
     /// Whether a drag is in flight (so the release hook bothers to resolve the
@@ -7807,6 +7845,29 @@ mod tests {
             scale: 1.0,
             is_primary: true,
         }
+    }
+
+    /// A drag pulled off one controlled machine can be relayed onward to
+    /// another only while it is still in the user's hand. `is_active` stays
+    /// true for seconds after the release so files still in flight get placed,
+    /// and reading THAT as "a relay is in progress" made the next crossing
+    /// forward a drag that had already been dropped here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drag_place_relay_closes_before_the_placement_grace_window() {
+        drag_place::begin("photo.png");
+        assert!(drag_place::is_relaying());
+        assert!(drag_place::is_active());
+
+        drag_place::release(None);
+        assert!(
+            drag_place::is_active(),
+            "late files must still find their target"
+        );
+        assert!(
+            !drag_place::is_relaying(),
+            "a released drag must not be forwarded to the next machine"
+        );
     }
 
     #[cfg(target_os = "macos")]
