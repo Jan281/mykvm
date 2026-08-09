@@ -47,6 +47,24 @@ import {
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
+import {
+  EDGE_SIDES,
+  clamp01,
+  connect,
+  edgeBlockedBy,
+  fractionToPixels,
+  moveBoundary,
+  pixelsToFraction,
+  sideLength,
+  setAnchorSpan,
+  edgeLinksFromGeometry,
+  effectiveEdgeLinks,
+  removeLink,
+  sideRunsHorizontally,
+  sideSegments,
+  splitSide,
+} from "./edgeLinks";
+import type { SideSegment } from "./edgeLinks";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -76,6 +94,9 @@ import type {
 import type {
   AppLanguage,
   Device,
+  EdgeAnchor,
+  EdgeLink,
+  EdgeSide,
   LayoutState,
   MachineRole,
   ModifierMap,
@@ -216,6 +237,10 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // The runtime reason already shown, so a persistent one is not re-raised on
+  // every poll. Cleared when the condition goes away, so it can speak up again
+  // if it comes back.
+  const reportedRuntimeErrorRef = useRef<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
@@ -542,11 +567,24 @@ function App() {
           // Keep a persistent blocking condition visible. The inject stage holds
           // the receiver-side reason keys/clicks get dropped (macOS Accessibility
           // missing, or Secure Keyboard Entry on); it is otherwise never shown.
+          // Raise it once per distinct reason. This poll runs every two
+          // seconds, and a condition that persists — a screen edge the
+          // compositor will not guard, say — used to reopen the dialog as fast
+          // as it could be dismissed, locking the user out of the very editor
+          // they needed to fix it.
           if (nextRuntime.started) {
-            if (nextRuntime.capture.state === "error") {
-              setErrorMessage(nextRuntime.capture.detail);
-            } else if (nextRuntime.inject.state === "error") {
-              setErrorMessage(nextRuntime.inject.detail);
+            const reason =
+              nextRuntime.capture.state === "error"
+                ? nextRuntime.capture.detail
+                : nextRuntime.inject.state === "error"
+                  ? nextRuntime.inject.detail
+                  : null;
+
+            if (reason !== reportedRuntimeErrorRef.current) {
+              reportedRuntimeErrorRef.current = reason;
+              if (reason) {
+                setErrorMessage(reason);
+              }
             }
           }
         })
@@ -1228,6 +1266,180 @@ function App() {
     }
   }
 
+  // Cuts the user has made but not yet wired. They live here rather than in the
+  // layout because an unconnected cut routes nothing — persisting it would save
+  // a decision that has no effect.
+  const [boardMode, setBoardMode] = useState<"screens" | "edges">("screens");
+  const [edgeCuts, setEdgeCuts] = useState<Record<string, number[]>>({});
+  const [pendingAnchor, setPendingAnchor] = useState<EdgeAnchor | null>(null);
+  const [edgeNotice, setEdgeNotice] = useState<string | null>(null);
+
+  const edgeLinks = useMemo(
+    () => (layout ? effectiveEdgeLinks(layout) : []),
+    [layout],
+  );
+  const localScreens = useMemo(
+    () => layout?.devices.find((device) => device.role === "local")?.screens ?? [],
+    [layout],
+  );
+
+  function cutsFor(screenId: string, side: EdgeSide) {
+    return edgeCuts[`${screenId}:${side}`] ?? [];
+  }
+
+  /** Writes the wiring, taking it over from geometry on the first edit. */
+  function updateEdgeLinks(mutator: (links: EdgeLink[]) => EdgeLink[]) {
+    updateLayout((current) => ({
+      ...current,
+      edgeLinks: mutator(effectiveEdgeLinks(current)),
+    }));
+  }
+
+  // Right-clicking a stretch opens this. Held by identity (screen, side, where
+  // it starts) rather than by value, so the panel keeps pointing at the same
+  // stretch while its bounds are being edited.
+  const [edgeDetail, setEdgeDetail] = useState<{
+    screenId: string;
+    side: EdgeSide;
+    start: number;
+    end: number;
+    left: number;
+    top: number;
+  } | null>(null);
+
+  const detailScreen = useMemo(
+    () => screens.find((item) => item.id === edgeDetail?.screenId) ?? null,
+    [screens, edgeDetail],
+  );
+  const detailSegment = useMemo(() => {
+    if (!edgeDetail || !detailScreen) return null;
+    return (
+      sideSegments(
+        edgeLinks,
+        edgeDetail.screenId,
+        edgeDetail.side,
+        cutsFor(edgeDetail.screenId, edgeDetail.side),
+      ).find((segment) => Math.abs(segment.start - edgeDetail.start) < 1e-6) ?? null
+    );
+  }, [edgeDetail, detailScreen, edgeLinks, edgeCuts]);
+
+  /** The far end of the link under the detail panel, if it is linked. */
+  const detailRemote = useMemo(() => {
+    const link = detailSegment?.link;
+    if (!link || !edgeDetail) return null;
+    const which: "a" | "b" =
+      link.a.screenId === edgeDetail.screenId && link.a.side === edgeDetail.side ? "b" : "a";
+    const anchor = link[which];
+    const screen = screens.find((item) => item.id === anchor.screenId);
+    return screen ? { link, which, anchor, screen } : null;
+  }, [detailSegment, edgeDetail, screens]);
+
+  /** Moves a boundary of the stretch under the panel, in pixels. */
+  function commitDetailBound(which: "start" | "end", pixels: number) {
+    if (!edgeDetail || !detailScreen) return;
+    const next = pixelsToFraction(pixels, detailScreen, edgeDetail.side);
+    const from = which === "start" ? edgeDetail.start : edgeDetail.end;
+    if (Math.abs(next - from) < 1e-6) return;
+
+    // A boundary is shared with the neighbouring stretch, so both move.
+    updateEdgeLinks((links) =>
+      moveBoundary(links, edgeDetail.screenId, edgeDetail.side, from, next),
+    );
+    const key = `${edgeDetail.screenId}:${edgeDetail.side}`;
+    setEdgeCuts((current) => ({
+      ...current,
+      [key]: (current[key] ?? []).map((cut) => (Math.abs(cut - from) < 1e-6 ? next : cut)),
+    }));
+    setEdgeDetail({ ...edgeDetail, [which]: next });
+  }
+
+  function commitDetailRemoteBound(which: "start" | "end", pixels: number) {
+    if (!detailRemote) return;
+    const { link, which: side, anchor, screen } = detailRemote;
+    const next = pixelsToFraction(pixels, screen, anchor.side);
+    updateEdgeLinks((links) =>
+      setAnchorSpan(
+        links,
+        link.id,
+        side,
+        which === "start" ? next : anchor.start,
+        which === "end" ? next : anchor.end,
+      ),
+    );
+  }
+
+  function handleSegmentClick(
+    screen: FlattenedScreen,
+    side: EdgeSide,
+    segment: SideSegment,
+    blocker: Screen | null,
+  ) {
+    setEdgeNotice(null);
+
+    // Clicking a wired stretch breaks that link — the same gesture that made it.
+    if (segment.link) {
+      updateEdgeLinks((links) => removeLink(links, segment.link!.id));
+      setPendingAnchor(null);
+      return;
+    }
+
+    // Refuse to wire an edge the compositor will not guard. The link would look
+    // right in the editor and simply never fire.
+    if (blocker) {
+      setEdgeNotice(`${ui.layout.edgesBlockedByCompositor} (${blocker.name})`);
+      return;
+    }
+
+    const anchor: EdgeAnchor = {
+      deviceId: screen.deviceId,
+      screenId: screen.id,
+      side,
+      start: segment.start,
+      end: segment.end,
+    };
+
+    if (!pendingAnchor) {
+      setPendingAnchor(anchor);
+      return;
+    }
+
+    if (pendingAnchor.screenId === anchor.screenId) {
+      setEdgeNotice(ui.layout.edgesSameScreen);
+      setPendingAnchor(anchor);
+      return;
+    }
+
+    updateEdgeLinks((links) => connect(links, pendingAnchor, anchor));
+    setPendingAnchor(null);
+  }
+
+  /** Double-click cuts a side where the pointer is, so it can feed two places. */
+  function handleSegmentSplit(
+    event: React.MouseEvent<HTMLButtonElement>,
+    screen: FlattenedScreen,
+    side: EdgeSide,
+  ) {
+    const strip = event.currentTarget.parentElement;
+    if (!strip) return;
+    const box = strip.getBoundingClientRect();
+    const fraction = sideRunsHorizontally(side)
+      ? (event.clientX - box.left) / Math.max(box.width, 1)
+      : (event.clientY - box.top) / Math.max(box.height, 1);
+
+    const { cut, blocked } = splitSide(edgeLinks, screen.id, side, clamp01(fraction));
+    if (blocked) {
+      setEdgeNotice(ui.layout.edgesSplitBlocked);
+      return;
+    }
+
+    setEdgeNotice(null);
+    const key = `${screen.id}:${side}`;
+    setEdgeCuts((current) => ({
+      ...current,
+      [key]: [...(current[key] ?? []), cut],
+    }));
+  }
+
   function boardRect(screen: Screen) {
     return {
       left:
@@ -1270,6 +1482,11 @@ function App() {
     screen: Screen,
   ) {
     event.preventDefault();
+    // Dragging a screen while wiring its edges would move the very thing being
+    // aimed at, so the rectangles hold still in edge mode.
+    if (boardMode === "edges") {
+      return;
+    }
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);
     setSnapshot((current) =>
@@ -2161,6 +2378,22 @@ function App() {
                 <h1>{ui.layout.title}</h1>
               </div>
               <div className="toolbar-actions">
+                <div className="board-mode-switch" role="group">
+                  <button
+                    type="button"
+                    className={boardMode === "screens" ? "active" : ""}
+                    onClick={() => setBoardMode("screens")}
+                  >
+                    {ui.layout.modeScreens}
+                  </button>
+                  <button
+                    type="button"
+                    className={boardMode === "edges" ? "active" : ""}
+                    onClick={() => setBoardMode("edges")}
+                  >
+                    {ui.layout.modeEdges}
+                  </button>
+                </div>
                 <span className={`status-pill ${isSaving ? "saving" : ""}`}>
                   {isSaving ? ui.common.saving : ui.common.synced}
                 </span>
@@ -2233,6 +2466,212 @@ function App() {
                   </button>
                 );
               })}
+
+              {boardMode === "edges"
+                ? screens.map((screen) => {
+                    const rect = boardRect(screen);
+                    const isLocal = screen.role === "local";
+
+                    return (
+                      <div
+                        key={`edges-${screen.id}`}
+                        className="screen-edges"
+                        style={{
+                          left: rect.left,
+                          top: rect.top,
+                          width: rect.width,
+                          height: rect.height,
+                        }}
+                      >
+                        {EDGE_SIDES.map((side) => {
+                          // Only our own screens can carry a barrier, so only
+                          // they can be blocked by a neighbour of ours.
+                          const blocker = isLocal
+                            ? edgeBlockedBy(screen, side, localScreens)
+                            : null;
+                          const segments = sideSegments(
+                            edgeLinks,
+                            screen.id,
+                            side,
+                            cutsFor(screen.id, side),
+                          );
+
+                          return (
+                            <div key={side} className={`edge-strip ${side}`}>
+                              {segments.map((segment) => {
+                                const selected =
+                                  pendingAnchor?.screenId === screen.id &&
+                                  pendingAnchor.side === side &&
+                                  Math.abs(pendingAnchor.start - segment.start) < 1e-6;
+                                const size = `${(segment.end - segment.start) * 100}%`;
+                                const offset = `${segment.start * 100}%`;
+
+                                return (
+                                  <button
+                                    key={`${segment.start}-${segment.end}`}
+                                    type="button"
+                                    className={`edge-segment ${segment.link ? "linked" : ""} ${
+                                      selected ? "selected" : ""
+                                    } ${blocker ? "blocked" : ""}`}
+                                    style={
+                                      sideRunsHorizontally(side)
+                                        ? { left: offset, width: size }
+                                        : { top: offset, height: size }
+                                    }
+                                    title={
+                                      blocker
+                                        ? `${ui.layout.edgesBlockedByCompositor} (${blocker.name})`
+                                        : segment.link
+                                          ? ui.layout.edgesUnlink
+                                          : ui.layout.edgesHint
+                                    }
+                                    onClick={() =>
+                                      handleSegmentClick(screen, side, segment, blocker)
+                                    }
+                                    onDoubleClick={(event) =>
+                                      handleSegmentSplit(event, screen, side)
+                                    }
+                                    onContextMenu={(event) => {
+                                      event.preventDefault();
+                                      const board =
+                                        boardRef.current?.getBoundingClientRect();
+                                      setEdgeDetail({
+                                        screenId: screen.id,
+                                        side,
+                                        start: segment.start,
+                                        end: segment.end,
+                                        left: event.clientX - (board?.left ?? 0),
+                                        top: event.clientY - (board?.top ?? 0),
+                                      });
+                                    }}
+                                  />
+                                );
+                              })}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })
+                : null}
+              {boardMode === "edges" && edgeDetail && detailScreen && detailSegment ? (
+                <div
+                  className="edge-detail"
+                  style={{ left: edgeDetail.left, top: edgeDetail.top }}
+                >
+                  <header>
+                    <strong>{ui.layout.detailTitle}</strong>
+                    <button type="button" onClick={() => setEdgeDetail(null)}>
+                      ×
+                    </button>
+                  </header>
+
+                  <p className="edge-detail-scope">
+                    {ui.layout.detailLocal} · {detailScreen.name} ·{" "}
+                    {ui.sides[edgeDetail.side]}
+                  </p>
+                  <div className="edge-detail-fields">
+                    <label>
+                      {ui.layout.detailStart}
+                      <input
+                        type="number"
+                        min={0}
+                        max={sideLength(detailScreen, edgeDetail.side)}
+                        defaultValue={fractionToPixels(
+                          detailSegment.start,
+                          detailScreen,
+                          edgeDetail.side,
+                        )}
+                        key={`start-${detailSegment.start}`}
+                        onBlur={(event) =>
+                          commitDetailBound("start", Number(event.target.value))
+                        }
+                      />
+                      <span>{ui.layout.detailPixels}</span>
+                    </label>
+                    <label>
+                      {ui.layout.detailEnd}
+                      <input
+                        type="number"
+                        min={0}
+                        max={sideLength(detailScreen, edgeDetail.side)}
+                        defaultValue={fractionToPixels(
+                          detailSegment.end,
+                          detailScreen,
+                          edgeDetail.side,
+                        )}
+                        key={`end-${detailSegment.end}`}
+                        onBlur={(event) =>
+                          commitDetailBound("end", Number(event.target.value))
+                        }
+                      />
+                      <span>{ui.layout.detailPixels}</span>
+                    </label>
+                  </div>
+
+                  {detailRemote ? (
+                    <>
+                      <p className="edge-detail-scope">
+                        {ui.layout.detailRemote} · {detailRemote.screen.name} ·{" "}
+                        {ui.sides[detailRemote.anchor.side]}
+                      </p>
+                      <div className="edge-detail-fields">
+                        <label>
+                          {ui.layout.detailStart}
+                          <input
+                            type="number"
+                            min={0}
+                            max={sideLength(detailRemote.screen, detailRemote.anchor.side)}
+                            defaultValue={fractionToPixels(
+                              detailRemote.anchor.start,
+                              detailRemote.screen,
+                              detailRemote.anchor.side,
+                            )}
+                            key={`remote-start-${detailRemote.anchor.start}`}
+                            onBlur={(event) =>
+                              commitDetailRemoteBound("start", Number(event.target.value))
+                            }
+                          />
+                          <span>{ui.layout.detailPixels}</span>
+                        </label>
+                        <label>
+                          {ui.layout.detailEnd}
+                          <input
+                            type="number"
+                            min={0}
+                            max={sideLength(detailRemote.screen, detailRemote.anchor.side)}
+                            defaultValue={fractionToPixels(
+                              detailRemote.anchor.end,
+                              detailRemote.screen,
+                              detailRemote.anchor.side,
+                            )}
+                            key={`remote-end-${detailRemote.anchor.end}`}
+                            onBlur={(event) =>
+                              commitDetailRemoteBound("end", Number(event.target.value))
+                            }
+                          />
+                          <span>{ui.layout.detailPixels}</span>
+                        </label>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => {
+                          updateEdgeLinks((links) =>
+                            removeLink(links, detailRemote.link.id),
+                          );
+                          setEdgeDetail(null);
+                        }}
+                      >
+                        {ui.layout.edgesUnlink}
+                      </button>
+                    </>
+                  ) : (
+                    <p className="edge-detail-note">{ui.layout.detailUnlinked}</p>
+                  )}
+                </div>
+              ) : null}
+
               <div className="board-zoom-controls">
                 <button
                   type="button"
@@ -2263,6 +2702,51 @@ function App() {
                 </button>
               </div>
             </div>
+
+            {boardMode === "edges" ? (
+              <div className="edge-editor-bar">
+                <p className="edge-editor-hint">
+                  {edgeNotice ??
+                    (edgeLinks.length === 0
+                      ? ui.layout.edgesEmpty
+                      : pendingAnchor
+                        ? `${ui.layout.edgesPending} ${
+                            screens.find((item) => item.id === pendingAnchor.screenId)
+                              ?.name ?? pendingAnchor.screenId
+                          } · ${ui.sides[pendingAnchor.side]}`
+                        : ui.layout.edgesHint)}
+                </p>
+                <div className="edge-editor-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      setEdgeCuts({});
+                      setPendingAnchor(null);
+                      setEdgeNotice(null);
+                      updateLayout((current) => ({
+                        ...current,
+                        edgeLinks: edgeLinksFromGeometry(current),
+                      }));
+                    }}
+                  >
+                    {ui.layout.edgesReset}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      setEdgeCuts({});
+                      setPendingAnchor(null);
+                      setEdgeNotice(null);
+                      updateLayout((current) => ({ ...current, edgeLinks: [] }));
+                    }}
+                  >
+                    {ui.layout.edgesClear}
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </section>
         </section>
       ) : null}

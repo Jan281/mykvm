@@ -46,6 +46,28 @@ export interface Screen {
   isPrimary: boolean
 }
 
+export type EdgeSide = 'left' | 'right' | 'top' | 'bottom'
+
+/**
+ * A stretch of one side of one screen. `start`/`end` are fractions of that
+ * side — 0 is the left end of a horizontal side, the top end of a vertical one
+ * — so a link survives a resolution change.
+ */
+export interface EdgeAnchor {
+  deviceId: string
+  screenId: string
+  side: EdgeSide
+  start: number
+  end: number
+}
+
+/** Two edge stretches wired together: leaving one lands on the other. */
+export interface EdgeLink {
+  id: string
+  a: EdgeAnchor
+  b: EdgeAnchor
+}
+
 export interface Device {
   id: string
   name: string
@@ -86,4 +108,10 @@ export interface LayoutState {
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
+  /**
+   * Explicit edge wiring. `null` means this layout predates the edge editor and
+   * still routes off where the screens sit; once it is an array the user has
+   * taken over, and only what is linked hands over — an empty array included.
+   */
+  edgeLinks: EdgeLink[] | null
 }

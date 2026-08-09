@@ -18,7 +18,10 @@
 
 use std::{
     os::unix::net::UnixStream,
-    sync::{mpsc, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -271,6 +274,9 @@ enum Command {
 pub struct CaptureService {
     command_tx: tokio::sync::mpsc::UnboundedSender<Command>,
     handler: Arc<Mutex<Option<EventHandler>>>,
+    /// Bumped on every arming, so a capture that has been replaced can tell
+    /// that the barriers now in force are no longer the ones it put there.
+    generation: AtomicU64,
 }
 
 impl CaptureService {
@@ -305,6 +311,7 @@ impl CaptureService {
             Ok(Ok(())) => Ok(Self {
                 command_tx,
                 handler,
+                generation: AtomicU64::new(0),
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err("The InputCapture portal did not respond. It needs xdg-desktop-portal with a backend that implements InputCapture (KDE Plasma 6.1+ or GNOME 46+).".into()),
@@ -312,7 +319,10 @@ impl CaptureService {
     }
 
     /// Points the existing session at a new set of screen edges.
+    ///
+    /// Returns the generation this arming created, for `disarm_generation`.
     pub fn arm(&self, barriers: Vec<BarrierSpec>, handler: EventHandler) -> Result<CaptureReady, String> {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut slot) = self.handler.lock() {
             *slot = Some(handler);
         }
@@ -337,6 +347,26 @@ impl CaptureService {
             *slot = None;
         }
         let _ = self.command_tx.send(Command::Disarm);
+    }
+
+    /// The generation currently armed. Capture hands this to its stop-watcher.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Disarms only if nothing has re-armed since `generation`.
+    ///
+    /// The session is process-wide, and a capture being replaced signals its
+    /// stop-watcher rather than joining it, so that thread can wake up to 200 ms
+    /// after its replacement has already armed. Disarming unconditionally there
+    /// tore down the *new* barriers: the log said the edges were armed, the
+    /// cursor still would not cross, and only a manual stop/start — slow enough
+    /// for the old thread to have finished — appeared to help.
+    pub fn disarm_generation(&self, generation: u64) {
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        self.disarm();
     }
 
     #[allow(dead_code)]

@@ -130,6 +130,38 @@ struct Screen {
     is_primary: bool,
 }
 
+/// A stretch of one side of one screen.
+///
+/// `start`/`end` are fractions of that side, so they survive resolution
+/// changes: 0 is the left end of a horizontal side and the top end of a
+/// vertical one. A whole side is 0.0 to 1.0.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeAnchor {
+    device_id: String,
+    screen_id: String,
+    /// "left" | "right" | "top" | "bottom"
+    side: String,
+    #[serde(default)]
+    start: f64,
+    #[serde(default = "default_edge_anchor_end")]
+    end: f64,
+}
+
+/// Two edge stretches wired together: leaving one lands on the other.
+///
+/// Links are bidirectional and say nothing about where the screens sit, which
+/// is the point — the screen rectangles are an arrangement the user finds
+/// readable, while the links are the actual routing. It also lets one side of a
+/// screen be split between several destinations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EdgeLink {
+    id: String,
+    a: EdgeAnchor,
+    b: EdgeAnchor,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Device {
@@ -244,6 +276,12 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+    /// Explicit edge wiring. `None` means this layout predates the edge editor
+    /// and its routing still comes from where the screens sit; `Some` means the
+    /// user has taken over, and then only what is linked hands over — including
+    /// `Some(vec![])`, which deliberately routes nothing.
+    #[serde(default)]
+    edge_links: Option<Vec<EdgeLink>>,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -3908,6 +3946,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         .unwrap_or_else(|| "local-display-1".into());
 
     LayoutState {
+        edge_links: None,
         active_device_id: device_id.clone(),
         selected_screen_id,
         input_mode: default_input_mode(),
@@ -3951,6 +3990,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
 
 fn detect_fallback_layout() -> LayoutState {
     LayoutState {
+        edge_links: None,
         devices: Vec::new(),
         active_device_id: String::new(),
         selected_screen_id: String::new(),
@@ -4065,6 +4105,9 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
     let transport_port = normalize_transport_port(saved_layout.transport_port);
 
     LayoutState {
+        // Carried straight through: routing the user drew is theirs to keep,
+        // and `None` here is what keeps a pre-editor layout on geometry.
+        edge_links: saved_layout.edge_links.clone(),
         devices,
         active_device_id,
         selected_screen_id,
@@ -4319,6 +4362,10 @@ fn default_performance_monitor() -> bool {
 
 fn default_start_minimized() -> bool {
     false
+}
+
+fn default_edge_anchor_end() -> f64 {
+    1.0
 }
 
 fn default_transport_port_mode() -> String {
@@ -7050,6 +7097,7 @@ mod tests {
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+            edge_links: None,
         }
     }
 
