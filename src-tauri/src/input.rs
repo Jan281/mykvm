@@ -1380,6 +1380,10 @@ fn start_platform_capture(
         .unwrap_or_default();
 
     let mut barriers: Vec<BarrierSpec> = Vec::new();
+    // Which local screen edge each barrier covers. The compositor names the
+    // barrier when it fires, and that is a far more reliable statement about
+    // where the pointer left than the position it reports alongside it.
+    let mut barrier_edges: Vec<(u32, String, Edge)> = Vec::new();
     let mut blocked_edges: Vec<String> = Vec::new();
     for target in &targets {
         let screen = &target.local_screen;
@@ -1444,6 +1448,7 @@ fn start_platform_capture(
             x2,
             y2,
         });
+        barrier_edges.push((id, target.layout_local_screen.id.clone(), target.edge));
     }
 
     let target_count = targets.len();
@@ -1461,19 +1466,18 @@ fn start_platform_capture(
             match event {
                 CaptureEvent::Activated { barrier_id, x, y } => {
                     log::info!("[wayland] activated barrier={barrier_id} cursor=({x},{y})");
-                    // Which barrier fired deliberately does not select the
-                    // target: remote screens sharing a local edge arm the same
-                    // segment, so only the crossing position tells them apart.
-                    active = linux_entry_target(&targets, x, y).and_then(|target| {
-                        let (dx, dy) = linux_outward_delta(target.edge);
-                        crossing_target(std::slice::from_ref(target), x, y, dx, dy)
-                    });
+                    active = barrier_edges
+                        .iter()
+                        .find(|(id, _, _)| *id == barrier_id)
+                        .and_then(|(_, screen_id, edge)| {
+                            linux_entry_from_barrier(&targets, screen_id, *edge, x, y)
+                        });
 
                     let Some(active_target) = active.as_ref() else {
                         // Nothing matched, so keeping the pointer captured would
                         // strand the user with a frozen cursor.
                         log::warn!(
-                            "[wayland] no target matched activation at ({x},{y}); releasing"
+                            "[wayland] barrier {barrier_id} matched no link (cursor ({x},{y})); releasing"
                         );
                         return Reaction::Release { x, y };
                     };
@@ -1725,46 +1729,6 @@ fn start_platform_capture(
     }
 }
 
-/// Picks which remote screen a barrier crossing hands over to.
-///
-/// The barrier that fired is not enough on its own: several remote screens can
-/// border the same local edge — a laptop with three displays under one panel —
-/// and they all arm the very same segment. Only the position along that edge
-/// says which of them the cursor is actually walking into.
-///
-/// `x`/`y` are compositor coordinates; the span check happens in layout space,
-/// which is where the remote screens are placed.
-#[cfg(target_os = "linux")]
-fn linux_entry_target<'a>(targets: &'a [InputTarget], x: f64, y: f64) -> Option<&'a InputTarget> {
-    let mut best: Option<(&InputTarget, f64)> = None;
-
-    for target in targets {
-        let (dx, dy) = linux_outward_delta(target.edge);
-        let Some((layout_x, layout_y)) = crossing_layout_point(target, x, y, dx, dy) else {
-            continue;
-        };
-
-        let fraction = side_fraction(&target.layout_local_screen, target.edge, layout_x, layout_y);
-
-        // Zero for the link that actually covers this spot; otherwise how far
-        // outside its stretch the crossing fell, so the nearest link still wins
-        // if a rounding step put it just past a seam between two of them.
-        let distance = if fraction < target.local_span.start {
-            target.local_span.start - fraction
-        } else if fraction > target.local_span.end {
-            fraction - target.local_span.end
-        } else {
-            0.0
-        };
-
-        if best.map(|(_, best_distance)| distance < best_distance).unwrap_or(true) {
-            best = Some((target, distance));
-        }
-    }
-
-    best.map(|(target, _)| target)
-}
-
 /// Names the local screen that makes an edge unusable for a pointer barrier, if
 /// there is one.
 ///
@@ -1822,6 +1786,103 @@ fn linux_edge_blocked_by<'a>(
         span_start <= other_end && other_start <= span_end
     })
 }
+
+/// Resolves a barrier activation into the hand-over it stands for.
+///
+/// The compositor already told us *which* barrier fired, and each barrier
+/// covers exactly one edge of one local screen, so screen and edge are known
+/// facts here — they do not need deriving from the cursor position. That
+/// matters, because KWin does not report where the barrier was touched: it
+/// reports `event->position + event->delta`, the point the pointer was heading
+/// for. A firm shove puts that well past the edge and can land it on an
+/// entirely different screen, which is why validating it against a tolerance
+/// band around the edge used to reject the crossing and release again a
+/// fraction of a second later.
+///
+/// So the reported point is pulled back onto the edge. Only its position
+/// *along* the edge carries information, and that is what selects which link —
+/// several remote screens can share one local edge, each taking a stretch of it.
+#[cfg(target_os = "linux")]
+fn linux_entry_from_barrier(
+    targets: &[InputTarget],
+    local_screen_id: &str,
+    edge: Edge,
+    x: f64,
+    y: f64,
+) -> Option<ActiveTarget> {
+    let candidates: Vec<&InputTarget> = targets
+        .iter()
+        .filter(|target| target.layout_local_screen.id == local_screen_id && target.edge == edge)
+        .collect();
+    let native = &candidates.first()?.local_screen;
+
+    let max_x = (native.x + native.width - 1) as f64;
+    let max_y = (native.y + native.height - 1) as f64;
+    let (point, overshoot) = match edge {
+        Edge::Top => (
+            (x.clamp(native.x as f64, max_x), native.y as f64),
+            (native.y as f64 - y).max(0.0),
+        ),
+        Edge::Bottom => (
+            (x.clamp(native.x as f64, max_x), max_y),
+            (y - max_y).max(0.0),
+        ),
+        Edge::Left => (
+            (native.x as f64, y.clamp(native.y as f64, max_y)),
+            (native.x as f64 - x).max(0.0),
+        ),
+        Edge::Right => (
+            (max_x, y.clamp(native.y as f64, max_y)),
+            (x - max_x).max(0.0),
+        ),
+    };
+
+    // Carrying the shove through keeps a fast crossing from feeling stuck at
+    // the far edge, but a huge reported overshoot must not fling the cursor
+    // across the remote screen.
+    let push = overshoot.min(MAX_ENTRY_PUSH);
+
+    let chosen = {
+        let layout_point = native_to_layout_point(candidates[0], point.0, point.1);
+        let fraction = side_fraction(
+            &candidates[0].layout_local_screen,
+            edge,
+            layout_point.0,
+            layout_point.1,
+        );
+
+        // Zero for the link covering this spot, otherwise how far outside its
+        // stretch the crossing fell, so the nearest still wins at a seam.
+        candidates.iter().copied().min_by(|a, b| {
+            let distance = |target: &InputTarget| {
+                if fraction < target.local_span.start {
+                    target.local_span.start - fraction
+                } else if fraction > target.local_span.end {
+                    fraction - target.local_span.end
+                } else {
+                    0.0
+                }
+            };
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?
+    };
+
+    let (layout_x, layout_y) = native_to_layout_point(chosen, point.0, point.1);
+    let (remote_x, remote_y) = link_entry_point(chosen, layout_x, layout_y, push);
+
+    Some(active_target_at(
+        chosen,
+        remote_x.clamp(0.0, (chosen.remote_screen.width - 1) as f64),
+        remote_y.clamp(0.0, (chosen.remote_screen.height - 1) as f64),
+        false,
+    ))
+}
+
+/// How far a reported overshoot may push the cursor into the remote screen.
+#[cfg(target_os = "linux")]
+const MAX_ENTRY_PUSH: f64 = 40.0;
 
 /// A small step outward through `edge`, used to ask the shared crossing logic
 /// which remote screen a barrier hand-off lands on.
@@ -4712,21 +4773,27 @@ fn crossing_target_with_transform(
             let remote_x = remote_x.clamp(0.0, (target.remote_screen.width - 1) as f64);
             let remote_y = remote_y.clamp(0.0, (target.remote_screen.height - 1) as f64);
 
-            // The screen we cross into is the entry screen; carry it (with its
-            // wire id) as the initial "current" screen so the cursor can later
-            // roam onto the remote device's other screens.
-            let mut current_screen = target.remote_screen.clone();
-            current_screen.id = target.screen_id.clone();
-
-            ActiveTarget {
-                target: target.clone(),
-                current_screen,
-                current_screen_id: target.screen_id.clone(),
-                x: remote_x,
-                y: remote_y,
-                invert_y,
-            }
+            active_target_at(target, remote_x, remote_y, invert_y)
         })
+}
+
+/// Wraps a target as the now-active hand-over, at a point on the remote screen.
+///
+/// The screen crossed into is the entry screen; it is carried (with its wire
+/// id) as the initial "current" screen so the cursor can later roam onto the
+/// remote device's other screens.
+fn active_target_at(target: &InputTarget, x: f64, y: f64, invert_y: bool) -> ActiveTarget {
+    let mut current_screen = target.remote_screen.clone();
+    current_screen.id = target.screen_id.clone();
+
+    ActiveTarget {
+        target: target.clone(),
+        current_screen,
+        current_screen_id: target.screen_id.clone(),
+        x,
+        y,
+        invert_y,
+    }
 }
 
 fn crossing_layout_point(
@@ -8419,12 +8486,9 @@ mod tests {
         // distance used to hand it the crossing.
         let targets = vec![left_off_hdmi, up_off_dp1];
 
-        let target = linux_entry_target(&targets, 268.0, 1078.0).expect("a target must match");
-        assert_eq!(target.edge, Edge::Top);
-
-        let (dx, dy) = linux_outward_delta(target.edge);
-        let active = crossing_target(std::slice::from_ref(target), 268.0, 1078.0, dx, dy)
+        let active = linux_entry_from_barrier(&targets, "dp-1", Edge::Top, 268.0, 1078.0)
             .expect("the crossing must resolve");
+        assert_eq!(active.target.edge, Edge::Top);
 
         // Enters near the bottom of the Windows screen (coming from below) at
         // the matching horizontal position — 268 in layout space, 179 of which
@@ -8476,11 +8540,13 @@ mod tests {
         // The left third goes to one machine, the right two thirds to another.
         let targets = vec![make("left-third", 0.0, 1.0 / 3.0), make("rest", 1.0 / 3.0, 1.0)];
 
-        let left = linux_entry_target(&targets, 1500.0, 3240.0).expect("left third matches");
-        assert_eq!(left.screen_id, "left-third");
+        let left = linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 1500.0, 3240.0)
+            .expect("left third matches");
+        assert_eq!(left.current_screen_id, "left-third");
 
-        let right = linux_entry_target(&targets, 4500.0, 3240.0).expect("right stretch matches");
-        assert_eq!(right.screen_id, "rest");
+        let right = linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 4500.0, 3240.0)
+            .expect("right stretch matches");
+        assert_eq!(right.current_screen_id, "rest");
 
         // A stretch shorter than the destination still walks the whole of it:
         // the far end of the left third arrives at the far end of that screen.
@@ -8502,6 +8568,40 @@ mod tests {
         // the user can make, not a layout we should second-guess.
         layout.edge_links = Some(Vec::new());
         assert!(build_input_targets(&layout, &layout).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_activation_reported_past_the_edge_still_hands_over() {
+        // Regression: KWin reports `position + delta` — where the pointer was
+        // heading, not where the barrier was touched. A firm shove put that
+        // well beyond the edge, and validating it against a tolerance band
+        // rejected the crossing, so capture activated and released again a
+        // fraction of a second later. The barrier itself names the edge, so the
+        // reported point only has to say *where along* it.
+        let local = screen("local-device", "dp-1", 0, 1080, 1200, 1920);
+        let target = wired_by_geometry(InputTarget {
+            edge: Edge::Bottom,
+            local_screen: local.clone(),
+            layout_local_screen: local,
+            remote_screen: screen("peer-device", "display-10", 280, 3000, 1920, 1080),
+            screen_id: "display-10".into(),
+            ..target_for_coordinate_tests()
+        });
+        let targets = vec![target];
+
+        // 400 px past the bottom edge, far outside any sane band.
+        let active = linux_entry_from_barrier(&targets, "dp-1", Edge::Bottom, 600.0, 3400.0)
+            .expect("a shove past the edge must still cross");
+        assert_eq!(active.current_screen_id, "display-10");
+        // Lands near the top of the remote screen, pushed in by at most the cap.
+        assert!(active.y <= 1.0 + MAX_ENTRY_PUSH, "entered at y={}", active.y);
+
+        // And a report that lands sideways on a different screen entirely is
+        // pulled back onto this edge rather than dropped.
+        let active = linux_entry_from_barrier(&targets, "dp-1", Edge::Bottom, 4000.0, 3050.0)
+            .expect("a sideways report must still cross");
+        assert_eq!(active.current_screen_id, "display-10");
     }
 
     #[cfg(target_os = "linux")]
@@ -8552,16 +8652,16 @@ mod tests {
         let targets = targets_for_entry_tests();
 
         // Crossing near the left of the panel is above DISPLAY10.
-        let target = linux_entry_target(&targets, 1500.0, 3240.0).unwrap();
-        assert_eq!(target.screen_id, "display-10");
+        let target = linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 1500.0, 3240.0).unwrap();
+        assert_eq!(target.current_screen_id, "display-10");
 
         // Middle: DISPLAY9.
-        let target = linux_entry_target(&targets, 3000.0, 3240.0).unwrap();
-        assert_eq!(target.screen_id, "display-9");
+        let target = linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 3000.0, 3240.0).unwrap();
+        assert_eq!(target.current_screen_id, "display-9");
 
         // Right: DISPLAY11.
-        let target = linux_entry_target(&targets, 4600.0, 3240.0).unwrap();
-        assert_eq!(target.screen_id, "display-11");
+        let target = linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 4600.0, 3240.0).unwrap();
+        assert_eq!(target.current_screen_id, "display-11");
     }
 
     #[cfg(target_os = "linux")]
@@ -8571,7 +8671,7 @@ mod tests {
         // not drop the crossing and leave the cursor stuck.
         let targets = targets_for_entry_tests();
 
-        assert!(linux_entry_target(&targets, 2200.0, 3240.0).is_some());
+        assert!(linux_entry_from_barrier(&targets, "dp-3", Edge::Bottom, 2200.0, 3240.0).is_some());
     }
 
     #[cfg(target_os = "linux")]
