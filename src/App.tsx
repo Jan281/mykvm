@@ -609,7 +609,7 @@ function App() {
     metrics: boardMetrics,
   };
   const machineRole = layout?.machineRole ?? "unset";
-  const language = layout?.language ?? "cn";
+  const language = layout?.language ?? "en";
   const themeMode = layout?.themeMode ?? "system";
   const resolvedTheme = resolveTheme(themeMode, systemTheme);
   const ui = TEXT[language];
@@ -1338,6 +1338,13 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       clipboardSync,
+    }));
+  }
+
+  function setStartMinimized(startMinimized: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      startMinimized,
     }));
   }
 
@@ -2517,6 +2524,13 @@ function App() {
                     >
                       {ui.settings.english}
                     </button>
+                    <button
+                      type="button"
+                      className={language === "de" ? "active" : ""}
+                      onClick={() => setLanguage("de")}
+                    >
+                      {ui.settings.german}
+                    </button>
                   </div>
                 </div>
                 <div className="settings-control-row">
@@ -2554,6 +2568,25 @@ function App() {
                       type="button"
                       className={!autostartEnabled ? "active" : ""}
                       onClick={() => void handleSetAutostart(false)}
+                    >
+                      {ui.settings.autostartOff}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.startMinimized}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.startMinimized ? "active" : ""}
+                      onClick={() => setStartMinimized(true)}
+                    >
+                      {ui.settings.autostartOn}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.startMinimized ? "active" : ""}
+                      onClick={() => setStartMinimized(false)}
                     >
                       {ui.settings.autostartOff}
                     </button>

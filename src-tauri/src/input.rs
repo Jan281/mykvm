@@ -664,6 +664,42 @@ fn remembered_local_screen_point(
     points.get(to_screen_id).copied().unwrap_or(fallback)
 }
 
+/// Identifies the wiring a running capture was armed with: which remote screen
+/// is reachable from which local screen edge.
+///
+/// Capture arms pointer barriers once, at start. If a device is still offline
+/// then — the normal case right after launch, since discovery needs a few
+/// seconds — there are no targets and nothing gets armed. Without comparing
+/// this fingerprint the runtime would count as "started" anyway and never
+/// re-arm when the device does show up, which is why capture used to need a
+/// manual stop/start.
+pub fn input_targets_fingerprint(layout: &LayoutState, native_layout: &LayoutState) -> String {
+    build_input_targets(layout, native_layout)
+        .iter()
+        .map(|target| {
+            // Both geometries matter: the local one decides where the barrier
+            // sits, the remote one decides how a crossing maps onto the peer's
+            // screen. A target that keeps its edge but moves the remote screen
+            // would otherwise keep mapping to stale coordinates.
+            format!(
+                "{}:{}:{:?}:{},{},{}x{}>{},{},{}x{}",
+                target.device_id,
+                target.screen_id,
+                target.edge,
+                target.local_screen.x,
+                target.local_screen.y,
+                target.local_screen.width,
+                target.local_screen.height,
+                target.remote_screen.x,
+                target.remote_screen.y,
+                target.remote_screen.width,
+                target.remote_screen.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 pub fn start_input_runtime(
     layout: LayoutState,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -686,6 +722,22 @@ pub fn start_input_runtime(
     }
 
     let targets = build_input_targets(&layout, &native_layout);
+    log::info!(
+        "[wayland] start_input_runtime mode={} devices={} targets={}",
+        layout.input_mode,
+        layout.devices.len(),
+        targets.len()
+    );
+    for device in layout.devices.iter().filter(|d| d.role != "local") {
+        log::info!(
+            "[wayland]   remote {} online={} input_ready={} proto={} screens={}",
+            device.name,
+            device.online,
+            device.input_ready,
+            device.protocol_version,
+            device.screens.len()
+        );
+    }
     let capture_status = start_input_capture(
         targets,
         layout_state,
@@ -1165,8 +1217,619 @@ fn start_platform_capture(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[cfg(not(target_os = "windows"))]
+/// Wayland capture via the InputCapture portal.
+///
+/// The shape differs from macOS and Windows: there is no global hook to install
+/// and no cursor to hide. We arm a pointer barrier on every local screen edge
+/// that faces a remote device and let the compositor decide when the pointer
+/// crosses one. From activation until we call release, the compositor owns the
+/// local cursor and streams relative motion to us, so all this code tracks is
+/// where the *remote* cursor should be and when to hand control back.
+#[cfg(target_os = "linux")]
+fn start_platform_capture(
+    targets: Vec<InputTarget>,
+    layout_state: Arc<Mutex<LayoutState>>,
+    native_layout: LayoutState,
+    quic_transport: quic_transport::TransportHandle,
+    stop: Arc<AtomicBool>,
+    remote_active: Arc<AtomicBool>,
+    _main_window_visible: Arc<AtomicBool>,
+    _main_window_focused: Arc<AtomicBool>,
+    clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
+    input_events: Arc<AtomicU64>,
+    _switch_request: Arc<Mutex<Option<SwitchDirection>>>,
+) -> NativeStageStatus {
+    use crate::linux_input::{self, BarrierSpec, CaptureEvent, LinuxButton, Reaction};
+
+    log::info!(
+        "[wayland] start_platform_capture entered with {} target(s)",
+        targets.len()
+    );
+
+    // Opening the session is what prompts the user for permission, so this runs
+    // even with nothing to arm — that is how the dialog lands at startup rather
+    // than whenever a peer happens to come online. The service is process-wide
+    // and survives stop/start; two concurrent sessions would stop the
+    // compositor arming barriers at all.
+    let service = match linux_input::service() {
+        Ok(service) => service,
+        Err(error) => {
+            log::error!("[wayland] portal session unavailable: {error}");
+            remote_active.store(false, Ordering::Relaxed);
+            clear_clipboard_target(&clipboard_target);
+            return NativeStageStatus {
+                state: "error".into(),
+                detail: error,
+            };
+        }
+    };
+
+    if targets.is_empty() {
+        log::warn!("[wayland] no targets: no local screen shares an edge with a remote screen");
+        service.disarm();
+        remote_active.store(false, Ordering::Relaxed);
+        clear_clipboard_target(&clipboard_target);
+        return no_target_status(&native_layout);
+    }
+
+    // Several remote screens can sit along one local edge — a laptop with three
+    // displays under the 4K panel produces three targets sharing that panel's
+    // bottom edge. They would yield identical barriers, so arm each segment
+    // once; which remote screen a crossing belongs to is decided from the
+    // position, not from which barrier fired.
+    let local_screens: Vec<Screen> = local_device(&native_layout)
+        .map(|device| device.screens.clone())
+        .unwrap_or_default();
+
+    let mut barriers: Vec<BarrierSpec> = Vec::new();
+    let mut blocked_edges: Vec<String> = Vec::new();
+    for target in &targets {
+        let screen = &target.local_screen;
+
+        // The portal only ever accepts a barrier covering a whole screen edge
+        // that no other screen touches, so an edge with a neighbour is a lost
+        // cause. Requesting it anyway would come back as a bare "failed" id and
+        // leave the user with a cursor that quietly hops to that neighbour.
+        if let Some(blocker) = linux_edge_blocked_by(screen, target.edge, &local_screens) {
+            let note = format!("{} ({:?} → {})", screen.name, target.edge, blocker.name);
+            log::warn!(
+                "[wayland] edge unusable: {:?} edge of {} borders local screen {}; KDE refuses barriers between two local screens, so crossings to device={} cannot happen here",
+                target.edge,
+                screen.name,
+                blocker.name,
+                target.device_id,
+            );
+            if !blocked_edges.contains(&note) {
+                blocked_edges.push(note);
+            }
+            continue;
+        }
+
+        let (x1, y1, x2, y2) = match target.edge {
+            Edge::Left => (screen.x, screen.y, screen.x, screen.y + screen.height - 1),
+            Edge::Right => (
+                screen.x + screen.width,
+                screen.y,
+                screen.x + screen.width,
+                screen.y + screen.height - 1,
+            ),
+            Edge::Top => (screen.x, screen.y, screen.x + screen.width - 1, screen.y),
+            Edge::Bottom => (
+                screen.x,
+                screen.y + screen.height,
+                screen.x + screen.width - 1,
+                screen.y + screen.height,
+            ),
+        };
+
+        if barriers
+            .iter()
+            .any(|existing| (existing.x1, existing.y1, existing.x2, existing.y2) == (x1, y1, x2, y2))
+        {
+            continue;
+        }
+
+        let id = (barriers.len() + 1) as u32;
+        log::info!(
+            "[wayland] barrier {id} for device={} edge={:?} local_screen=({},{},{}x{}) segment=({x1},{y1})-({x2},{y2})",
+            target.device_id,
+            target.edge,
+            screen.x,
+            screen.y,
+            screen.width,
+            screen.height,
+        );
+        barriers.push(BarrierSpec {
+            id,
+            x1,
+            y1,
+            x2,
+            y2,
+        });
+    }
+
+    let target_count = targets.len();
+    let mut active: Option<ActiveTarget> = None;
+    // Bounded diagnostics: enough to see whether motion keeps flowing after a
+    // hand-over and whether it reaches the peer, without logging every sample.
+    let mut motion_count: u64 = 0;
+    let mut send_failures: u64 = 0;
+    let stopped_remote_active = Arc::clone(&remote_active);
+    let stopped_clipboard_target = Arc::clone(&clipboard_target);
+
+    let armed = service.arm(
+        barriers,
+        Box::new(move |event| {
+            match event {
+                CaptureEvent::Activated { barrier_id, x, y } => {
+                    log::info!("[wayland] activated barrier={barrier_id} cursor=({x},{y})");
+                    // Which barrier fired deliberately does not select the
+                    // target: remote screens sharing a local edge arm the same
+                    // segment, so only the crossing position tells them apart.
+                    active = linux_entry_target(&targets, x, y).and_then(|target| {
+                        let (dx, dy) = linux_outward_delta(target.edge);
+                        crossing_target(std::slice::from_ref(target), x, y, dx, dy)
+                    });
+
+                    let Some(active_target) = active.as_ref() else {
+                        // Nothing matched, so keeping the pointer captured would
+                        // strand the user with a frozen cursor.
+                        log::warn!(
+                            "[wayland] no target matched activation at ({x},{y}); releasing"
+                        );
+                        return Reaction::Release { x, y };
+                    };
+
+                    log::info!(
+                        "[wayland] handing over to device={} screen={} at remote=({},{})",
+                        active_target.target.device_id,
+                        active_target.current_screen_id,
+                        active_target.x.round(),
+                        active_target.y.round()
+                    );
+                    motion_count = 0;
+                    send_failures = 0;
+                    remote_active.store(true, Ordering::Relaxed);
+                    set_control_clipboard_target(&clipboard_target, active_target, &layout_state);
+                    send_packet(
+                        &quic_transport,
+                        &active_target.target,
+                        InputEvent::MouseMove {
+                            screen_id: active_target.current_screen_id.clone(),
+                            x: active_target.x.round() as i32,
+                            y: active_target.y.round() as i32,
+                        },
+                        &layout_state,
+                        &input_events,
+                    );
+                    Reaction::Continue
+                }
+
+                CaptureEvent::Motion { dx, dy } => {
+                    let Some(active_target) = active.as_mut() else {
+                        return Reaction::Continue;
+                    };
+                    motion_count += 1;
+                    active_target.x += dx;
+                    active_target.y += dy;
+
+                    // Leaving is not tied to the edge we entered by. A remote
+                    // screen can border several local screens — this setup
+                    // reaches the laptop both from below and from the right —
+                    // and running off any of those sides has to bring the
+                    // cursor home, not just retracing the way in.
+                    let max_x = (active_target.current_screen.width - 1) as f64;
+                    let max_y = (active_target.current_screen.height - 1) as f64;
+
+                    if let Some((exit_target, local_x, local_y)) = linux_exit_return(
+                        &targets,
+                        &active_target.current_screen_id,
+                        &active_target.current_screen,
+                        active_target.x,
+                        active_target.y,
+                    ) {
+                        log::info!(
+                            "[wayland] returning to local screen {} via {:?} edge at ({local_x:.0},{local_y:.0}) after {motion_count} motion event(s), {send_failures} send failure(s)",
+                            exit_target.local_screen.id,
+                            exit_target.edge
+                        );
+                        active = None;
+                        remote_active.store(false, Ordering::Relaxed);
+                        clear_clipboard_target(&clipboard_target);
+                        return Reaction::Release {
+                            x: local_x,
+                            y: local_y,
+                        };
+                    }
+
+                    active_target.x = active_target.x.clamp(0.0, max_x);
+                    active_target.y = active_target.y.clamp(0.0, max_y);
+                    let sent = send_packet(
+                        &quic_transport,
+                        &active_target.target,
+                        InputEvent::MouseMove {
+                            screen_id: active_target.current_screen_id.clone(),
+                            x: active_target.x.round() as i32,
+                            y: active_target.y.round() as i32,
+                        },
+                        &layout_state,
+                        &input_events,
+                    );
+                    if !sent {
+                        send_failures += 1;
+                    }
+                    // Per-motion detail is only interesting while debugging a
+                    // hand-over; the summary on the way back carries the counts
+                    // that matter day to day.
+                    if motion_count <= 3 || motion_count % 250 == 0 {
+                        log::debug!(
+                            "[wayland] motion #{motion_count} d=({dx:.1},{dy:.1}) remote=({:.0},{:.0}) sent={sent} failures={send_failures}",
+                            active_target.x,
+                            active_target.y
+                        );
+                    }
+                    Reaction::Continue
+                }
+
+                CaptureEvent::Button { button, down } => {
+                    if let Some(active_target) = active.as_ref() {
+                        let button = match button {
+                            LinuxButton::Left => MouseButton::Left,
+                            LinuxButton::Right => MouseButton::Right,
+                            LinuxButton::Middle => MouseButton::Middle,
+                            LinuxButton::Back => MouseButton::Back,
+                            LinuxButton::Forward => MouseButton::Forward,
+                        };
+                        send_packet(
+                            &quic_transport,
+                            &active_target.target,
+                            InputEvent::MouseButton { button, down },
+                            &layout_state,
+                            &input_events,
+                        );
+                    }
+                    Reaction::Continue
+                }
+
+                CaptureEvent::Scroll { delta_x, delta_y } => {
+                    if let Some(active_target) = active.as_ref() {
+                        send_packet(
+                            &quic_transport,
+                            &active_target.target,
+                            InputEvent::Scroll { delta_x, delta_y },
+                            &layout_state,
+                            &input_events,
+                        );
+                    }
+                    Reaction::Continue
+                }
+
+                CaptureEvent::Key { vk, down } => {
+                    if let Some(active_target) = active.as_ref() {
+                        send_packet(
+                            &quic_transport,
+                            &active_target.target,
+                            InputEvent::Key {
+                                key_code: vk,
+                                down,
+                            },
+                            &layout_state,
+                            &input_events,
+                        );
+                    }
+                    Reaction::Continue
+                }
+
+                CaptureEvent::Deactivated => {
+                    active = None;
+                    remote_active.store(false, Ordering::Relaxed);
+                    clear_clipboard_target(&clipboard_target);
+                    Reaction::Continue
+                }
+            }
+        }),
+    );
+
+    // The runtime signals a stop by flipping this flag. Drop the barriers when
+    // it does, but leave the session open so turning sharing back on does not
+    // ask the user for permission again.
+    {
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(200));
+            }
+            service.disarm();
+            stopped_remote_active.store(false, Ordering::Relaxed);
+            clear_clipboard_target(&stopped_clipboard_target);
+        });
+    }
+
+    // Edges KDE can never arm are worth spelling out: from the user's side the
+    // symptom is just a cursor that hops to the neighbouring monitor.
+    let blocked_note = if blocked_edges.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " KDE cannot guard these edges because another local screen borders them: {}. Cross to that device from an edge with nothing of yours next to it.",
+            blocked_edges.join(", ")
+        )
+    };
+
+    match armed {
+        Ok(ready) => {
+            log::info!(
+                "[wayland] portal ready: accepted={} failed={:?} zones={:?}",
+                ready.accepted_barriers,
+                ready.failed_barriers,
+                ready.zones
+            );
+            if ready.accepted_barriers == 0 {
+                NativeStageStatus {
+                    state: "error".into(),
+                    detail: format!(
+                        "The compositor rejected every screen-edge barrier. Requested {} for screen edges facing a remote device; portal zones are {:?}. Barriers must sit exactly on an output edge, so this usually means MyKVM's screen coordinates disagree with the compositor's.{}",
+                        target_count, ready.zones, blocked_note
+                    ),
+                }
+            } else if ready.failed_barriers.is_empty() {
+                NativeStageStatus {
+                    state: "ready".into(),
+                    detail: format!(
+                        "Wayland capture ready via the InputCapture portal, {} screen edge(s) armed.{}",
+                        ready.accepted_barriers, blocked_note
+                    ),
+                }
+            } else {
+                NativeStageStatus {
+                    state: "ready".into(),
+                    detail: format!(
+                        "Wayland capture ready, {} of {} screen edge(s) armed. The compositor rejected barrier ids {:?}, so those edges will not hand over.{}",
+                        ready.accepted_barriers, target_count, ready.failed_barriers, blocked_note
+                    ),
+                }
+            }
+        }
+        Err(error) => {
+            log::error!("[wayland] arming barriers failed: {error}");
+            NativeStageStatus {
+                state: "error".into(),
+                detail: error,
+            }
+        }
+    }
+}
+
+/// Picks which remote screen a barrier crossing hands over to.
+///
+/// The barrier that fired is not enough on its own: several remote screens can
+/// border the same local edge — a laptop with three displays under one panel —
+/// and they all arm the very same segment. Only the position along that edge
+/// says which of them the cursor is actually walking into.
+///
+/// `x`/`y` are compositor coordinates; the span check happens in layout space,
+/// which is where the remote screens are placed.
+#[cfg(target_os = "linux")]
+fn linux_entry_target<'a>(targets: &'a [InputTarget], x: f64, y: f64) -> Option<&'a InputTarget> {
+    let mut best: Option<(&InputTarget, f64)> = None;
+
+    for target in targets {
+        let (dx, dy) = linux_outward_delta(target.edge);
+        let Some((layout_x, layout_y)) = crossing_layout_point(target, x, y, dx, dy) else {
+            continue;
+        };
+
+        let remote = &target.remote_screen;
+        let (along, start, extent) = match target.edge {
+            Edge::Top | Edge::Bottom => (layout_x, remote.x as f64, remote.width as f64),
+            Edge::Left | Edge::Right => (layout_y, remote.y as f64, remote.height as f64),
+        };
+
+        // Zero for the screen that actually covers this spot; otherwise how far
+        // outside it lies, so the nearest one still wins if a rounding step put
+        // the crossing just past a seam.
+        let distance = if along < start {
+            start - along
+        } else if along > start + extent {
+            along - (start + extent)
+        } else {
+            0.0
+        };
+
+        if best.map(|(_, best_distance)| distance < best_distance).unwrap_or(true) {
+            best = Some((target, distance));
+        }
+    }
+
+    best.map(|(target, _)| target)
+}
+
+/// Names the local screen that makes an edge unusable for a pointer barrier, if
+/// there is one.
+///
+/// This mirrors `checkAndMakeBarrier` in xdg-desktop-portal-kde, whose own
+/// comment states the rule: a barrier is allowed only if it lies *fully on one
+/// screen edge* and that edge is *not next to any other screen*. The portal
+/// walks every screen whose edge falls on the barrier's line, and the moment it
+/// meets a second one it answers `BetweenScreensOrDoesNotFill`.
+///
+/// Both halves of that rule bite on the 4K panel's top edge: HDMI-A-1's bottom
+/// edge sits on the very same line, so the full-width barrier is refused for
+/// touching another screen — and trimming the barrier to the free left half is
+/// refused too, because it no longer fills the edge. No such edge can ever be
+/// armed, so detect it up front and say so, instead of leaving the user with a
+/// cursor that silently hops to the neighbouring monitor.
+#[cfg(target_os = "linux")]
+fn linux_edge_blocked_by<'a>(
+    screen: &Screen,
+    edge: Edge,
+    local_screens: &'a [Screen],
+) -> Option<&'a Screen> {
+    // The line the barrier would sit on, plus the stretch it would cover along
+    // that line (inclusive, as the portal compares against `bottom()`).
+    let (line, span_start, span_end, horizontal) = match edge {
+        Edge::Top => (screen.y, screen.x, screen.x + screen.width - 1, true),
+        Edge::Bottom => (
+            screen.y + screen.height,
+            screen.x,
+            screen.x + screen.width - 1,
+            true,
+        ),
+        Edge::Left => (screen.x, screen.y, screen.y + screen.height - 1, false),
+        Edge::Right => (
+            screen.x + screen.width,
+            screen.y,
+            screen.y + screen.height - 1,
+            false,
+        ),
+    };
+
+    local_screens.iter().find(|other| {
+        if other.id == screen.id {
+            return false;
+        }
+        let (near, extent, other_start, other_span) = if horizontal {
+            (other.y, other.height, other.x, other.width)
+        } else {
+            (other.x, other.width, other.y, other.height)
+        };
+        // Only a screen with one of its own edges on this exact line counts.
+        if line != near && line != near + extent {
+            return false;
+        }
+        let (other_start, other_end) = (other_start, other_start + other_span - 1);
+        span_start <= other_end && other_start <= span_end
+    })
+}
+
+/// A small step outward through `edge`, used to ask the shared crossing logic
+/// which remote screen a barrier hand-off lands on.
+#[cfg(target_os = "linux")]
+fn linux_outward_delta(edge: Edge) -> (f64, f64) {
+    match edge {
+        Edge::Left => (-1.0, 0.0),
+        Edge::Right => (1.0, 0.0),
+        Edge::Top => (0.0, -1.0),
+        Edge::Bottom => (0.0, 1.0),
+    }
+}
+
+/// Where to drop the local cursor when handing control back, in compositor
+/// coordinates: just inside the edge it left by, at the same relative position
+/// along that edge, so the pointer reappears where the user expects it.
+#[cfg(target_os = "linux")]
+/// Rescales an offset from one screen's extent to another's.
+#[cfg(target_os = "linux")]
+fn linux_scale_axis(offset: f64, from_extent: i32, to_extent: i32) -> f64 {
+    let from = (from_extent - 1).max(1) as f64;
+    let to = (to_extent - 1).max(1) as f64;
+    offset * to / from
+}
+
+/// Picks the local screen the cursor should reappear on after running off the
+/// remote, and where on it.
+///
+/// Two things make this more than "look up the edge we came in by". A remote
+/// screen can border *several* local screens on the same side — here the
+/// laptop sits above both DP-1 and the 4K panel — so the exit position along
+/// the shared edge decides which one. And the layout the user arranges is not
+/// the compositor's coordinate space (HDMI-A-1 is at x=2099 in the layout but
+/// x=2219 natively), so the position is reasoned about in layout space and
+/// converted back to native space for the portal.
+///
+/// Returns the chosen target and the native cursor position, or `None` while
+/// the cursor is still on the remote screen.
+#[cfg(target_os = "linux")]
+fn linux_exit_return<'a>(
+    targets: &'a [InputTarget],
+    screen_id: &str,
+    remote: &Screen,
+    remote_x: f64,
+    remote_y: f64,
+) -> Option<(&'a InputTarget, f64, f64)> {
+    let max_x = (remote.width - 1) as f64;
+    let max_y = (remote.height - 1) as f64;
+
+    // `target.edge` says where the remote sits relative to a local screen, so
+    // leaving the remote on one side means wanting a target pointing the other
+    // way: off the remote's right lands on a screen that has it to its left.
+    let (wanted, horizontal_exit) = if remote_x < 0.0 {
+        (Edge::Right, true)
+    } else if remote_x > max_x {
+        (Edge::Left, true)
+    } else if remote_y < 0.0 {
+        (Edge::Bottom, false)
+    } else if remote_y > max_y {
+        (Edge::Top, false)
+    } else {
+        return None;
+    };
+
+    // Where along the shared edge the cursor left, in layout coordinates.
+    let exit_along = if horizontal_exit {
+        remote.y as f64 + remote_y
+    } else {
+        remote.x as f64 + remote_x
+    };
+
+    let candidates = targets
+        .iter()
+        .filter(|target| target.edge == wanted && target.screen_id == screen_id);
+
+    // Prefer the screen that actually spans the exit point; if the cursor left
+    // past the end of every candidate, fall back to the nearest so it still
+    // comes home instead of being stranded.
+    let chosen = candidates.min_by(|a, b| {
+        let distance = |target: &InputTarget| {
+            let screen = &target.layout_local_screen;
+            let (start, extent) = if horizontal_exit {
+                (screen.y as f64, screen.height as f64)
+            } else {
+                (screen.x as f64, screen.width as f64)
+            };
+            if exit_along < start {
+                start - exit_along
+            } else if exit_along > start + extent {
+                exit_along - (start + extent)
+            } else {
+                0.0
+            }
+        };
+        distance(a)
+            .partial_cmp(&distance(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+
+    let layout_local = &chosen.layout_local_screen;
+    let native_local = &chosen.local_screen;
+
+    let point = if horizontal_exit {
+        let offset =
+            (exit_along - layout_local.y as f64).clamp(0.0, (layout_local.height - 1).max(1) as f64);
+        let native_y = native_local.y as f64
+            + linux_scale_axis(offset, layout_local.height, native_local.height);
+        let native_x = if matches!(chosen.edge, Edge::Right) {
+            (native_local.x + native_local.width - 2) as f64
+        } else {
+            (native_local.x + 1) as f64
+        };
+        (native_x, native_y)
+    } else {
+        let offset =
+            (exit_along - layout_local.x as f64).clamp(0.0, (layout_local.width - 1).max(1) as f64);
+        let native_x = native_local.x as f64
+            + linux_scale_axis(offset, layout_local.width, native_local.width);
+        let native_y = if matches!(chosen.edge, Edge::Bottom) {
+            (native_local.y + native_local.height - 2) as f64
+        } else {
+            (native_local.y + 1) as f64
+        };
+        (native_x, native_y)
+    };
+
+    Some((chosen, point.0, point.1))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn start_platform_capture(
     _targets: Vec<InputTarget>,
     _layout_state: Arc<Mutex<LayoutState>>,
@@ -3853,14 +4516,19 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
     let previous_x = x - dx;
     let previous_y = y - dy;
 
-    // Require the previous reconstructed point to already be near the shared
-    // edge. This still permits fast edge flicks, but rejects a single huge jump
-    // from the middle of the screen that merely lands near the boundary.
+    // Require the previous reconstructed point to sit in a narrow band *around*
+    // the shared edge — bounded on both sides. The inner bound still permits
+    // fast edge flicks while rejecting a single huge jump out of the middle of
+    // the screen; the outer bound is what keeps a point that is nowhere near
+    // this screen from qualifying. Without it, "left of the left edge" was true
+    // for the whole desktop, so leaving DP-1 upwards also satisfied HDMI-A-1's
+    // left edge and handed over to the wrong screen corner.
     match edge {
         Edge::Right => {
             dx >= MIN_CROSSING_DELTA
                 && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
                 && previous_x >= right - CROSSING_ACTIVATION_BAND
+                && previous_x <= right + CROSSING_ACTIVATION_BAND
                 && x >= right - CROSSING_MARGIN
                 && y >= top - CROSSING_MARGIN
                 && y <= bottom + CROSSING_MARGIN
@@ -3869,6 +4537,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
             dx <= -MIN_CROSSING_DELTA
                 && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE
                 && previous_x <= left + CROSSING_ACTIVATION_BAND
+                && previous_x >= left - CROSSING_ACTIVATION_BAND
                 && x <= left + CROSSING_MARGIN
                 && y >= top - CROSSING_MARGIN
                 && y <= bottom + CROSSING_MARGIN
@@ -3877,6 +4546,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
             dy >= MIN_CROSSING_DELTA
                 && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
                 && previous_y >= bottom - CROSSING_ACTIVATION_BAND
+                && previous_y <= bottom + CROSSING_ACTIVATION_BAND
                 && y >= bottom - CROSSING_MARGIN
                 && x >= left - CROSSING_MARGIN
                 && x <= right + CROSSING_MARGIN
@@ -3885,6 +4555,7 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
             dy <= -MIN_CROSSING_DELTA
                 && dy.abs() >= dx.abs() * CROSSING_AXIS_DOMINANCE
                 && previous_y <= top + CROSSING_ACTIVATION_BAND
+                && previous_y >= top - CROSSING_ACTIVATION_BAND
                 && y <= top + CROSSING_MARGIN
                 && x >= left - CROSSING_MARGIN
                 && x <= right + CROSSING_MARGIN
@@ -6051,6 +6722,7 @@ mod tests {
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,
+            start_minimized: false,
             transport_port_mode: "auto".into(),
             transport_port: 47833,
             quic_port: 47834,
@@ -7319,5 +7991,296 @@ mod tests {
         let targets = build_input_targets(&layout, &layout);
 
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_peer_comes_online() {
+        // Capture arms its pointer barriers once. Right after launch discovery
+        // has not seen the peer yet, so there is nothing to arm; the runtime
+        // must notice when that changes instead of staying idle until the user
+        // stops and starts it by hand.
+        let mut layout = layout_for_target_tests();
+        layout.devices[1].online = false;
+        let offline = input_targets_fingerprint(&layout, &layout);
+
+        layout.devices[1].online = true;
+        let online = input_targets_fingerprint(&layout, &layout);
+
+        assert!(offline.is_empty());
+        assert!(!online.is_empty());
+        assert_ne!(offline, online);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_while_the_wiring_is_unchanged() {
+        // The flip side: an unchanged fingerprint is what keeps a working
+        // capture from being torn down and re-armed on every status poll.
+        let layout = layout_for_target_tests();
+
+        assert_eq!(
+            input_targets_fingerprint(&layout, &layout),
+            input_targets_fingerprint(&layout, &layout)
+        );
+    }
+
+    /// Mirrors the real desk this was debugged against: the laptop sits above
+    /// *two* local screens (a narrow portrait panel on the left and a wide 4K
+    /// one beside it) and to the left of a third.
+    #[cfg(target_os = "linux")]
+    fn targets_for_exit_tests() -> (Screen, Vec<InputTarget>) {
+        let remote = screen("peer-device", "remote-1", 179, 0, 1920, 1080);
+        let make = |name: &str, edge: Edge, x: i32, y: i32, w: i32, h: i32| InputTarget {
+            edge,
+            local_screen: screen("local-device", name, x, y, w, h),
+            layout_local_screen: screen("local-device", name, x, y, w, h),
+            remote_screen: remote.clone(),
+            ..target_for_coordinate_tests()
+        };
+
+        let targets = vec![
+            make("dp-1", Edge::Top, 0, 1080, 1200, 1920),
+            make("dp-3", Edge::Top, 1200, 1080, 3840, 2160),
+            make("hdmi", Edge::Left, 2099, 0, 1920, 1080),
+        ];
+        (remote, targets)
+    }
+
+    /// A laptop with three displays strung out along the bottom edge of one
+    /// local panel — every target shares that edge, so only the crossing
+    /// position separates them.
+    #[cfg(target_os = "linux")]
+    fn targets_for_entry_tests() -> Vec<InputTarget> {
+        let local = screen("local-device", "dp-3", 1200, 1080, 3840, 2160);
+        let make = |name: &str, x: i32, w: i32| InputTarget {
+            edge: Edge::Bottom,
+            local_screen: local.clone(),
+            layout_local_screen: local.clone(),
+            remote_screen: screen("peer-device", name, x, 3240, w, 1080),
+            screen_id: name.into(),
+            ..target_for_coordinate_tests()
+        };
+
+        vec![
+            make("display-9", 2200, 1920),
+            make("display-10", 280, 1920),
+            make("display-11", 4120, 1920),
+        ]
+    }
+
+    /// The real desk, in compositor coordinates: the 4K panel with HDMI-A-1
+    /// above its right half and the two portrait panels flanking it.
+    #[cfg(target_os = "linux")]
+    fn local_screens_for_barrier_tests() -> Vec<Screen> {
+        vec![
+            screen("local-device", "dp-3", 1200, 1080, 3840, 2160),
+            screen("local-device", "hdmi-a-1", 2219, 0, 1920, 1080),
+            screen("local-device", "dp-1", 0, 1080, 1200, 1920),
+            screen("local-device", "dp-2", 5040, 1080, 1200, 1920),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leaving_one_screen_does_not_satisfy_a_far_away_screens_edge() {
+        // Regression: crossing up off DP-1 (x 0..1200) landed in the bottom
+        // right corner of the Windows screen, because the left-edge test only
+        // asked whether the cursor was left *of* HDMI-A-1's left edge at
+        // x=2219 — true for the entire rest of the desktop — so the wrong
+        // target won and the entry point was computed for a left crossing.
+        let windows = screen("peer-win", "display-1", 179, 0, 1920, 1080);
+
+        let up_off_dp1 = InputTarget {
+            edge: Edge::Top,
+            local_screen: screen("local-device", "dp-1", 0, 1080, 1200, 1920),
+            layout_local_screen: screen("local-device", "dp-1", 0, 1080, 1200, 1920),
+            remote_screen: windows.clone(),
+            screen_id: "display-1".into(),
+            ..target_for_coordinate_tests()
+        };
+        let left_off_hdmi = InputTarget {
+            edge: Edge::Left,
+            local_screen: screen("local-device", "hdmi-a-1", 2219, 0, 1920, 1080),
+            layout_local_screen: screen("local-device", "hdmi-a-1", 2099, 0, 1920, 1080),
+            remote_screen: windows,
+            screen_id: "display-1".into(),
+            ..target_for_coordinate_tests()
+        };
+
+        // Order matters: the left-edge target is listed first, so a tie on
+        // distance used to hand it the crossing.
+        let targets = vec![left_off_hdmi, up_off_dp1];
+
+        let target = linux_entry_target(&targets, 268.0, 1078.0).expect("a target must match");
+        assert_eq!(target.edge, Edge::Top);
+
+        let (dx, dy) = linux_outward_delta(target.edge);
+        let active = crossing_target(std::slice::from_ref(target), 268.0, 1078.0, dx, dy)
+            .expect("the crossing must resolve");
+
+        // Enters near the bottom of the Windows screen (coming from below) at
+        // the matching horizontal position — 268 in layout space, 179 of which
+        // is the screen's own offset.
+        assert_eq!(active.x.round() as i32, 89);
+        assert!(active.y >= 1070.0, "entered at y={}", active.y);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_edge_a_local_screen_borders_is_reported_as_unusable() {
+        // The portal allows a barrier only if it fills one screen edge that no
+        // other screen touches. HDMI-A-1's bottom edge lies on the same line as
+        // the 4K panel's top edge, so that edge fails both ways: full width it
+        // borders HDMI-A-1, trimmed it no longer fills the edge. Crossing up
+        // there just slid the cursor onto HDMI-A-1.
+        let locals = local_screens_for_barrier_tests();
+        let dp3 = locals[0].clone();
+
+        let blocker = linux_edge_blocked_by(&dp3, Edge::Top, &locals).expect("top edge is blocked");
+        assert_eq!(blocker.name, "hdmi-a-1");
+
+        // Same story on the left: DP-1 sits flush against it.
+        let blocker =
+            linux_edge_blocked_by(&dp3, Edge::Left, &locals).expect("left edge is blocked");
+        assert_eq!(blocker.name, "dp-1");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn edges_facing_empty_space_stay_armable() {
+        let locals = local_screens_for_barrier_tests();
+        let dp3 = locals[0].clone();
+
+        // Nothing of the user's sits below the 4K panel — this is the edge the
+        // laptop hands over on.
+        assert!(linux_edge_blocked_by(&dp3, Edge::Bottom, &locals).is_none());
+
+        // HDMI-A-1's left edge: the 4K panel spans x 1200..5040, but 2219 is
+        // interior to it, not one of its edges, so nothing blocks this.
+        assert!(linux_edge_blocked_by(&locals[1], Edge::Left, &locals).is_none());
+
+        // DP-1's top edge shares the line y=1080 with the 4K panel's, but their
+        // spans do not overlap, so the portal accepts it.
+        assert!(linux_edge_blocked_by(&locals[2], Edge::Top, &locals).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn entry_picks_the_remote_screen_under_the_crossing_point() {
+        // Regression: the target used to be chosen from the barrier that fired,
+        // but screens sharing a local edge arm identical barriers, so every
+        // crossing landed on whichever target happened to come first.
+        let targets = targets_for_entry_tests();
+
+        // Crossing near the left of the panel is above DISPLAY10.
+        let target = linux_entry_target(&targets, 1500.0, 3240.0).unwrap();
+        assert_eq!(target.screen_id, "display-10");
+
+        // Middle: DISPLAY9.
+        let target = linux_entry_target(&targets, 3000.0, 3240.0).unwrap();
+        assert_eq!(target.screen_id, "display-9");
+
+        // Right: DISPLAY11.
+        let target = linux_entry_target(&targets, 4600.0, 3240.0).unwrap();
+        assert_eq!(target.screen_id, "display-11");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn entry_falls_back_to_the_nearest_remote_screen_at_a_seam() {
+        // Crossing right where two remote screens meet must still hand over,
+        // not drop the crossing and leave the cursor stuck.
+        let targets = targets_for_entry_tests();
+
+        assert!(linux_entry_target(&targets, 2200.0, 3240.0).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exiting_downwards_picks_the_screen_actually_under_that_spot() {
+        // Both portrait and 4K sit below the laptop, so the horizontal position
+        // at which the cursor leaves decides which one it lands on. Taking the
+        // first matching edge would always drop it on the same screen.
+        let (remote, targets) = targets_for_exit_tests();
+
+        // Leaving near the laptop's left: layout x = 179 + 300 = 479 -> DP-1.
+        let (target, _, _) =
+            linux_exit_return(&targets, "local-display-1", &remote, 300.0, 1200.0).unwrap();
+        assert_eq!(target.local_screen.id, "dp-1");
+
+        // Leaving near its right: layout x = 179 + 1500 = 1679 -> the 4K panel.
+        let (target, _, _) =
+            linux_exit_return(&targets, "local-display-1", &remote, 1500.0, 1200.0).unwrap();
+        assert_eq!(target.local_screen.id, "dp-3");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exit_keeps_the_cursor_where_the_layout_says_rather_than_rescaling() {
+        // The laptop is 1920 wide, the 4K panel 3840. Mapping proportionally
+        // would double every position; the screens share a coordinate space, so
+        // the absolute spot is what the user expects.
+        let (remote, targets) = targets_for_exit_tests();
+
+        let (target, x, y) =
+            linux_exit_return(&targets, "local-display-1", &remote, 1500.0, 1200.0).unwrap();
+
+        assert_eq!(target.local_screen.id, "dp-3");
+        assert!((x - 1679.0).abs() < 2.0, "unexpected x: {x}");
+        // Just inside the top edge of the screen below.
+        assert_eq!(y, 1081.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exiting_sideways_uses_the_screen_beside_it_not_the_one_below() {
+        let (remote, targets) = targets_for_exit_tests();
+
+        let (target, x, _) =
+            linux_exit_return(&targets, "local-display-1", &remote, 2000.0, 500.0).unwrap();
+
+        assert_eq!(target.local_screen.id, "hdmi");
+        assert_eq!(x, 2100.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staying_on_the_remote_reports_no_exit() {
+        let (remote, targets) = targets_for_exit_tests();
+
+        assert!(linux_exit_return(&targets, "local-display-1", &remote, 500.0, 500.0).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exit_maps_layout_coordinates_onto_the_compositors_own() {
+        // The arrangement the user drags around is not the compositor's
+        // coordinate space, so a return point computed in layout space has to
+        // be converted or the cursor reappears in the wrong place.
+        let remote = screen("peer-device", "remote-1", 0, 0, 1920, 1080);
+        let target = InputTarget {
+            edge: Edge::Top,
+            layout_local_screen: screen("local-device", "scaled", 0, 1080, 1920, 1080),
+            local_screen: screen("local-device", "scaled", 5000, 2000, 3840, 2160),
+            remote_screen: remote.clone(),
+            ..target_for_coordinate_tests()
+        };
+
+        let (_, x, y) =
+            linux_exit_return(&[target], "local-display-1", &remote, 960.0, 1200.0).unwrap();
+
+        // Halfway across in layout space stays halfway across natively.
+        assert!((x - (5000.0 + 1920.0)).abs() < 3.0, "unexpected x: {x}");
+        assert_eq!(y, 2001.0);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_screen_moves_in_the_layout() {
+        let mut layout = layout_for_target_tests();
+        let before = input_targets_fingerprint(&layout, &layout);
+
+        layout.devices[1].screens[0].y += 240;
+        let after = input_targets_fingerprint(&layout, &layout);
+
+        assert_ne!(before, after);
     }
 }

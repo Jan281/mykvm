@@ -32,3 +32,6 @@ tmp/
 *.njsproj
 *.sln
 *.sw?
+
+# Local build output (105 MB AppImage, not source)
+releases/

@@ -2,7 +2,7 @@ export type Platform = 'windows' | 'macos' | 'unknown'
 
 export type MachineRole = 'unset' | 'server' | 'client'
 
-export type AppLanguage = 'cn' | 'en'
+export type AppLanguage = 'cn' | 'en' | 'de'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
@@ -78,6 +78,7 @@ export interface LayoutState {
   language: AppLanguage
   themeMode: ThemeMode
   performanceMonitor: boolean
+  startMinimized: boolean
   transportPortMode: TransportPortMode
   transportPort: number
   quicPort: number

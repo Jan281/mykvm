@@ -24,6 +24,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
 mod input;
+#[cfg(target_os = "linux")]
+pub mod linux_input;
 mod performance;
 mod quic_transport;
 pub mod shared_input;
@@ -223,6 +225,11 @@ struct LayoutState {
     theme_mode: String,
     #[serde(default = "default_performance_monitor")]
     performance_monitor: bool,
+    /// Start into the tray instead of showing the window. Separate from the
+    /// autostart flag so it also applies to launches from a desktop entry or a
+    /// wrapper script, which carry no arguments of ours.
+    #[serde(default = "default_start_minimized")]
+    start_minimized: bool,
     #[serde(default = "default_transport_port_mode")]
     transport_port_mode: String,
     #[serde(default = "default_transport_port")]
@@ -495,6 +502,9 @@ struct AppRuntime {
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Wiring the running capture was armed with, so a changed layout or a
+    /// device coming online can re-arm it instead of being ignored.
+    input_targets_key: Mutex<Option<String>>,
     clipboard_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
     clipboard_echo_until: Arc<Mutex<Option<Instant>>>,
@@ -533,6 +543,7 @@ impl AppRuntime {
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
+            input_targets_key: Mutex::new(None),
             clipboard_stop: Mutex::new(None),
             clipboard_seen_text: Arc::new(Mutex::new(None)),
             clipboard_echo_until: Arc::new(Mutex::new(None)),
@@ -1035,8 +1046,29 @@ impl AppRuntime {
             );
         };
 
+        let targets_key = input::input_targets_fingerprint(&layout, &native_layout);
+
         if input_stop.is_some() {
-            return input::input_runtime_status(&layout, &native_layout);
+            let unchanged = self
+                .input_targets_key
+                .lock()
+                .map(|key| key.as_deref() == Some(targets_key.as_str()))
+                .unwrap_or(false);
+
+            if unchanged {
+                return input::input_runtime_status(&layout, &native_layout);
+            }
+
+            // The wiring changed under a running capture — a device came
+            // online, went away, or the user moved a screen in the layout.
+            // Barriers are armed once at start, so the old session is now
+            // stale and has to be torn down before re-arming.
+            log::info!("[wayland] capture targets changed, re-arming");
+            if let Some(signal) = input_stop.take() {
+                signal.store(true, Ordering::Relaxed);
+            }
+            self.remote_input_active.store(false, Ordering::Relaxed);
+            input::clear_clipboard_target(&self.clipboard_target);
         }
 
         let Some(quic_transport) = self.quic_transport_handle() else {
@@ -1064,6 +1096,9 @@ impl AppRuntime {
             Arc::clone(&self.screen_switch_request),
         );
         *input_stop = Some(stop);
+        if let Ok(mut key) = self.input_targets_key.lock() {
+            *key = Some(targets_key);
+        }
         statuses
     }
 
@@ -1138,6 +1173,57 @@ impl AppRuntime {
         }
     }
 
+    /// Re-arms capture when the wiring changed under a *running* runtime — a
+    /// peer coming online, dropping off, or a screen moving in the layout.
+    ///
+    /// Capture arms its pointer barriers once, at start, from the targets that
+    /// exist at that moment. Nothing else calls `start_input` afterwards:
+    /// discovery updates peers directly on the layout without going back
+    /// through the input runtime. So a peer that appears seconds after launch
+    /// — the normal case — used to leave capture armed with nothing, and only
+    /// a manual stop/start would pick it up.
+    ///
+    /// Deliberately does nothing when the runtime is stopped: a runtime the
+    /// user turned off must stay off.
+    fn rearm_input_if_wiring_changed(&self) -> bool {
+        let layout = self.layout_snapshot();
+        if layout.input_mode == "receive" {
+            return false;
+        }
+
+        let native_layout = self.native_layout();
+        let key = input::input_targets_fingerprint(&layout, &native_layout);
+
+        {
+            let running = self
+                .input_stop
+                .lock()
+                .map(|stop| stop.is_some())
+                .unwrap_or(false);
+            if !running {
+                return false;
+            }
+
+            let unchanged = self
+                .input_targets_key
+                .lock()
+                .map(|armed| armed.as_deref() == Some(key.as_str()))
+                .unwrap_or(false);
+            if unchanged {
+                return false;
+            }
+        }
+
+        // Fingerprint differs, so start_input tears the stale session down and
+        // arms the new wiring.
+        let (capture, inject) = self.start_input(layout);
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.capture = capture;
+            runtime.inject = inject;
+        }
+        true
+    }
+
     fn layout_snapshot(&self) -> LayoutState {
         sync_layout_peer_presence(&self.layout, &self.peers);
         self.layout
@@ -1172,6 +1258,11 @@ impl AppRuntime {
             if let Some(signal) = stop.take() {
                 signal.store(true, Ordering::Relaxed);
             }
+        }
+        // Forget the armed wiring too, or the next start would compare against
+        // a stale fingerprint and skip re-arming.
+        if let Ok(mut key) = self.input_targets_key.lock() {
+            *key = None;
         }
         self.remote_input_active.store(false, Ordering::Relaxed);
         input::clear_clipboard_target(&self.clipboard_target);
@@ -2861,6 +2952,25 @@ pub fn run() {
             // binds the UDP socket and begins announcing within ~1 s of process
             // launch, so the peer picks us back up in one announce cycle.
             {
+                // Discovery needs a few seconds to find a peer, and capture can
+                // only arm once one exists. Poll for that change instead of
+                // leaving the user to notice nothing happened and press
+                // stop/start by hand.
+                {
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let Some(state) = handle.try_state::<AppRuntime>() else {
+                            break;
+                        };
+                        if state.inner().rearm_input_if_wiring_changed() {
+                            if let Ok(runtime) = state.inner().runtime.lock() {
+                                notify_runtime_state_changed(&handle, &runtime);
+                            }
+                        }
+                    });
+                }
+
                 let state = app.state::<AppRuntime>();
                 let runtime_ref = state.inner();
                 let layout = runtime_ref.layout_snapshot();
@@ -2901,7 +3011,16 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
-            if silent_launch {
+            // The autostart flag only covers launches the plugin registered
+            // itself; a desktop entry or wrapper script carries no arguments of
+            // ours, which is exactly the case where an unwanted window in your
+            // face is most annoying. The saved preference covers both.
+            let start_minimized = app
+                .try_state::<AppRuntime>()
+                .map(|state| state.inner().layout_snapshot().start_minimized)
+                .unwrap_or(false);
+
+            if silent_launch || start_minimized {
                 hide_main_window_handle(app.handle())?;
             } else {
                 show_main_window_handle(app.handle())?;
@@ -3801,6 +3920,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
+        start_minimized: default_start_minimized(),
         transport_port_mode: default_transport_port_mode(),
         transport_port,
         quic_port,
@@ -3844,6 +3964,7 @@ fn detect_fallback_layout() -> LayoutState {
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
+        start_minimized: default_start_minimized(),
         transport_port_mode: default_transport_port_mode(),
         transport_port: default_transport_port(),
         quic_port: preferred_quic_port(default_transport_port()),
@@ -3957,6 +4078,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
+        start_minimized: saved_layout.start_minimized,
         transport_port_mode: normalize_transport_port_mode(&saved_layout.transport_port_mode),
         transport_port,
         quic_port: normalize_quic_port(transport_port, saved_layout.quic_port),
@@ -4184,7 +4306,7 @@ fn default_file_transfer_enabled() -> bool {
 }
 
 fn default_language() -> String {
-    "cn".into()
+    "en".into()
 }
 
 fn default_theme_mode() -> String {
@@ -4192,6 +4314,10 @@ fn default_theme_mode() -> String {
 }
 
 fn default_performance_monitor() -> bool {
+    false
+}
+
+fn default_start_minimized() -> bool {
     false
 }
 
@@ -4311,8 +4437,11 @@ fn normalize_paired_controllers(controllers: Vec<PairedController>) -> Vec<Paire
 
 fn normalize_language(language: &str) -> String {
     match language {
-        "en" => "en".into(),
-        _ => "cn".into(),
+        "cn" => "cn".into(),
+        "de" => "de".into(),
+        // Anything unrecognised (including an empty saved value) falls back to
+        // English rather than to the original Simplified Chinese default.
+        _ => "en".into(),
     }
 }
 
@@ -6913,6 +7042,7 @@ mod tests {
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,
+            start_minimized: false,
             transport_port_mode: "auto".into(),
             transport_port: 49152,
             quic_port: 49153,
