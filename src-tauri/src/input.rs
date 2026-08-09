@@ -1525,6 +1525,7 @@ fn start_platform_capture(
 
                     if let Some((exit_target, local_x, local_y)) = linux_exit_return(
                         &targets,
+                        &active_target.target.device_id,
                         &active_target.current_screen_id,
                         &active_target.current_screen,
                         active_target.x,
@@ -1913,6 +1914,7 @@ fn linux_outward_delta(edge: Edge) -> (f64, f64) {
 #[cfg(target_os = "linux")]
 fn linux_exit_return<'a>(
     targets: &'a [InputTarget],
+    device_id: &str,
     screen_id: &str,
     remote: &Screen,
     remote_x: f64,
@@ -1936,9 +1938,16 @@ fn linux_exit_return<'a>(
 
     // Only links attached to the side the cursor actually left by. Several may
     // share that side, each covering a stretch of it.
-    let candidates = targets
-        .iter()
-        .filter(|target| target.remote_edge == left_by && target.screen_id == screen_id);
+    // Both the device and the screen have to match. Screen ids travel with the
+    // device prefix stripped, so every peer's first screen is "local-display-1"
+    // — filtering on that alone let a crossing off one machine's screen exit
+    // through a link belonging to another, dropping the cursor wherever that
+    // unrelated link happened to start.
+    let candidates = targets.iter().filter(|target| {
+        target.remote_edge == left_by
+            && target.screen_id == screen_id
+            && target.device_id == device_id
+    });
 
     // Prefer the link whose stretch covers the exit point; if the cursor left
     // past the end of every one, fall back to the nearest so it still comes
@@ -8583,6 +8592,63 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn leaving_one_peer_cannot_exit_through_another_peers_link() {
+        // Regression: screen ids travel with the device prefix stripped, so the
+        // first screen of *every* peer is "local-display-1". Matching the exit
+        // on that alone meant leaving the Windows box by an edge it has no link
+        // for still found the laptop's link — and dropped the cursor in the
+        // middle of the 4K panel, where that unrelated link starts.
+        let panel = screen("local-device", "dp-3", 1200, 1080, 3840, 2160);
+        let portrait = screen("local-device", "dp-1", 0, 1080, 1200, 1920);
+
+        let laptop_from_panel = wired_by_geometry(InputTarget {
+            device_id: "peer-laptop".into(),
+            edge: Edge::Bottom,
+            local_screen: panel.clone(),
+            layout_local_screen: panel,
+            remote_screen: screen("peer-laptop", "display-9", 2200, 3240, 1920, 1200),
+            screen_id: "local-display-1".into(),
+            ..target_for_coordinate_tests()
+        });
+        let windows_from_portrait = wired_by_geometry(InputTarget {
+            device_id: "peer-windows".into(),
+            edge: Edge::Top,
+            local_screen: portrait.clone(),
+            layout_local_screen: portrait,
+            remote_screen: screen("peer-windows", "display-1", 0, -180, 1920, 1080),
+            screen_id: "local-display-1".into(),
+            ..target_for_coordinate_tests()
+        });
+        let targets = vec![laptop_from_panel, windows_from_portrait];
+        let windows_screen = targets[1].remote_screen.clone();
+
+        // Off the top of the Windows screen. It has no link there, so the
+        // cursor must stay put rather than surface on an unrelated screen.
+        assert!(linux_exit_return(
+            &targets,
+            "peer-windows",
+            "local-display-1",
+            &windows_screen,
+            900.0,
+            -5.0,
+        )
+        .is_none());
+
+        // Its own edge still works, and lands on its own local screen.
+        let (target, _, _) = linux_exit_return(
+            &targets,
+            "peer-windows",
+            "local-display-1",
+            &windows_screen,
+            900.0,
+            1085.0,
+        )
+        .expect("its own bottom edge still returns");
+        assert_eq!(target.local_screen.id, "dp-1");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn an_activation_reported_past_the_edge_still_hands_over() {
         // Regression: KWin reports `position + delta` — where the pointer was
         // heading, not where the barrier was touched. A firm shove put that
@@ -8695,12 +8761,12 @@ mod tests {
 
         // Leaving near the laptop's left: layout x = 179 + 300 = 479 -> DP-1.
         let (target, _, _) =
-            linux_exit_return(&targets, "local-display-1", &remote, 300.0, 1200.0).unwrap();
+            linux_exit_return(&targets, "peer-device", "local-display-1", &remote, 300.0, 1200.0).unwrap();
         assert_eq!(target.local_screen.id, "dp-1");
 
         // Leaving near its right: layout x = 179 + 1500 = 1679 -> the 4K panel.
         let (target, _, _) =
-            linux_exit_return(&targets, "local-display-1", &remote, 1500.0, 1200.0).unwrap();
+            linux_exit_return(&targets, "peer-device", "local-display-1", &remote, 1500.0, 1200.0).unwrap();
         assert_eq!(target.local_screen.id, "dp-3");
     }
 
@@ -8713,7 +8779,7 @@ mod tests {
         let (remote, targets) = targets_for_exit_tests();
 
         let (target, x, y) =
-            linux_exit_return(&targets, "local-display-1", &remote, 1500.0, 1200.0).unwrap();
+            linux_exit_return(&targets, "peer-device", "local-display-1", &remote, 1500.0, 1200.0).unwrap();
 
         assert_eq!(target.local_screen.id, "dp-3");
         assert!((x - 1679.0).abs() < 2.0, "unexpected x: {x}");
@@ -8727,7 +8793,7 @@ mod tests {
         let (remote, targets) = targets_for_exit_tests();
 
         let (target, x, _) =
-            linux_exit_return(&targets, "local-display-1", &remote, 2000.0, 500.0).unwrap();
+            linux_exit_return(&targets, "peer-device", "local-display-1", &remote, 2000.0, 500.0).unwrap();
 
         assert_eq!(target.local_screen.id, "hdmi");
         assert_eq!(x, 2100.0);
@@ -8738,7 +8804,7 @@ mod tests {
     fn staying_on_the_remote_reports_no_exit() {
         let (remote, targets) = targets_for_exit_tests();
 
-        assert!(linux_exit_return(&targets, "local-display-1", &remote, 500.0, 500.0).is_none());
+        assert!(linux_exit_return(&targets, "peer-device", "local-display-1", &remote, 500.0, 500.0).is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -8760,7 +8826,7 @@ mod tests {
         };
 
         let (_, x, y) =
-            linux_exit_return(&[target], "local-display-1", &remote, 960.0, 1200.0).unwrap();
+            linux_exit_return(&[target], "peer-device", "local-display-1", &remote, 960.0, 1200.0).unwrap();
 
         // Halfway across in layout space stays halfway across natively.
         assert!((x - (5000.0 + 1920.0)).abs() < 3.0, "unexpected x: {x}");
