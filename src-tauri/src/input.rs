@@ -17,7 +17,7 @@ use crate::{
         button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
         LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
     },
-    Device, LayoutState, NativeStageStatus, Screen,
+    Device, EdgeAnchor, EdgeLink, LayoutState, NativeStageStatus, Screen,
 };
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
@@ -198,6 +198,88 @@ enum Edge {
     Bottom,
 }
 
+impl Edge {
+    fn from_side(side: &str) -> Option<Edge> {
+        match side {
+            "left" => Some(Edge::Left),
+            "right" => Some(Edge::Right),
+            "top" => Some(Edge::Top),
+            "bottom" => Some(Edge::Bottom),
+            _ => None,
+        }
+    }
+
+    fn as_side(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        }
+    }
+
+    fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
+        }
+    }
+
+    /// Horizontal sides run along x, vertical sides along y.
+    fn runs_horizontally(self) -> bool {
+        matches!(self, Edge::Top | Edge::Bottom)
+    }
+}
+
+/// The stretch of a screen side a link occupies, as fractions of that side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EdgeSpan {
+    start: f64,
+    end: f64,
+}
+
+impl EdgeSpan {
+    fn whole() -> Self {
+        Self { start: 0.0, end: 1.0 }
+    }
+
+    fn from_anchor(anchor: &EdgeAnchor) -> Self {
+        let (start, end) = if anchor.start <= anchor.end {
+            (anchor.start, anchor.end)
+        } else {
+            (anchor.end, anchor.start)
+        };
+        Self {
+            start: start.clamp(0.0, 1.0),
+            end: end.clamp(0.0, 1.0),
+        }
+    }
+
+    fn contains(&self, fraction: f64) -> bool {
+        fraction >= self.start - EDGE_SPAN_SLACK && fraction <= self.end + EDGE_SPAN_SLACK
+    }
+
+    /// Where `fraction` (of the whole side) sits inside this span, 0..1.
+    fn position_of(&self, fraction: f64) -> f64 {
+        let width = self.end - self.start;
+        if width <= f64::EPSILON {
+            return 0.5;
+        }
+        ((fraction - self.start) / width).clamp(0.0, 1.0)
+    }
+
+    /// The inverse: a 0..1 position inside this span, as a fraction of the side.
+    fn fraction_at(&self, position: f64) -> f64 {
+        self.start + position.clamp(0.0, 1.0) * (self.end - self.start)
+    }
+}
+
+/// Fractions are compared against spans that the user dragged by hand, so allow
+/// a sliver of tolerance rather than dropping a crossing right on a boundary.
+const EDGE_SPAN_SLACK: f64 = 0.002;
+
 #[derive(Debug, Clone)]
 struct InputTarget {
     device_id: String,
@@ -213,6 +295,14 @@ struct InputTarget {
     layout_local_screen: Screen,
     remote_screen: Screen,
     edge: Edge,
+    /// The stretch of `edge` this target covers. Two remote screens can share
+    /// one local edge, each taking part of it.
+    local_span: EdgeSpan,
+    /// Which side of the remote screen the cursor appears on, and where along
+    /// it. Not necessarily the opposite of `edge`: a link may join a bottom
+    /// edge to another bottom edge if that is how the desks actually stand.
+    remote_edge: Edge,
+    remote_span: EdgeSpan,
 }
 
 #[derive(Debug, Clone)]
@@ -681,11 +771,19 @@ pub fn input_targets_fingerprint(layout: &LayoutState, native_layout: &LayoutSta
             // sits, the remote one decides how a crossing maps onto the peer's
             // screen. A target that keeps its edge but moves the remote screen
             // would otherwise keep mapping to stale coordinates.
+            // The spans belong here too: redrawing a link to cover a different
+            // stretch of the same edge changes the routing without moving a
+            // single screen, and capture has to be re-armed for it.
             format!(
-                "{}:{}:{:?}:{},{},{}x{}>{},{},{}x{}",
+                "{}:{}:{:?}[{:.4}-{:.4}]>{:?}[{:.4}-{:.4}]:{},{},{}x{}>{},{},{}x{}",
                 target.device_id,
                 target.screen_id,
                 target.edge,
+                target.local_span.start,
+                target.local_span.end,
+                target.remote_edge,
+                target.remote_span.start,
+                target.remote_span.end,
                 target.local_screen.x,
                 target.local_screen.y,
                 target.local_screen.width,
@@ -1618,19 +1716,15 @@ fn linux_entry_target<'a>(targets: &'a [InputTarget], x: f64, y: f64) -> Option<
             continue;
         };
 
-        let remote = &target.remote_screen;
-        let (along, start, extent) = match target.edge {
-            Edge::Top | Edge::Bottom => (layout_x, remote.x as f64, remote.width as f64),
-            Edge::Left | Edge::Right => (layout_y, remote.y as f64, remote.height as f64),
-        };
+        let fraction = side_fraction(&target.layout_local_screen, target.edge, layout_x, layout_y);
 
-        // Zero for the screen that actually covers this spot; otherwise how far
-        // outside it lies, so the nearest one still wins if a rounding step put
-        // the crossing just past a seam.
-        let distance = if along < start {
-            start - along
-        } else if along > start + extent {
-            along - (start + extent)
+        // Zero for the link that actually covers this spot; otherwise how far
+        // outside its stretch the crossing fell, so the nearest link still wins
+        // if a rounding step put it just past a seam between two of them.
+        let distance = if fraction < target.local_span.start {
+            target.local_span.start - fraction
+        } else if fraction > target.local_span.end {
+            fraction - target.local_span.end
         } else {
             0.0
         };
@@ -1713,28 +1807,17 @@ fn linux_outward_delta(edge: Edge) -> (f64, f64) {
     }
 }
 
-/// Where to drop the local cursor when handing control back, in compositor
-/// coordinates: just inside the edge it left by, at the same relative position
-/// along that edge, so the pointer reappears where the user expects it.
-#[cfg(target_os = "linux")]
-/// Rescales an offset from one screen's extent to another's.
-#[cfg(target_os = "linux")]
-fn linux_scale_axis(offset: f64, from_extent: i32, to_extent: i32) -> f64 {
-    let from = (from_extent - 1).max(1) as f64;
-    let to = (to_extent - 1).max(1) as f64;
-    offset * to / from
-}
-
-/// Picks the local screen the cursor should reappear on after running off the
-/// remote, and where on it.
+/// Picks where the local cursor reappears after running off the remote screen.
 ///
-/// Two things make this more than "look up the edge we came in by". A remote
-/// screen can border *several* local screens on the same side — here the
-/// laptop sits above both DP-1 and the 4K panel — so the exit position along
-/// the shared edge decides which one. And the layout the user arranges is not
-/// the compositor's coordinate space (HDMI-A-1 is at x=2099 in the layout but
-/// x=2219 natively), so the position is reasoned about in layout space and
-/// converted back to native space for the portal.
+/// With explicit links this is just the entry mapping read backwards: the side
+/// the cursor left on selects the link, the position along that side maps
+/// through the two spans, and the result is a point just inside the local end
+/// of the link. Which local screen that is falls out of the link — it is no
+/// longer inferred from where the rectangles sit.
+///
+/// The one wrinkle is coordinate space: the user arranges screens in layout
+/// coordinates, but the portal wants the compositor's (HDMI-A-1 is at x=2099 in
+/// the layout and x=2219 natively), so the final point is converted.
 ///
 /// Returns the chosen target and the native cursor position, or `None` while
 /// the cursor is still on the remote screen.
@@ -1749,47 +1832,34 @@ fn linux_exit_return<'a>(
     let max_x = (remote.width - 1) as f64;
     let max_y = (remote.height - 1) as f64;
 
-    // `target.edge` says where the remote sits relative to a local screen, so
-    // leaving the remote on one side means wanting a target pointing the other
-    // way: off the remote's right lands on a screen that has it to its left.
-    let (wanted, horizontal_exit) = if remote_x < 0.0 {
-        (Edge::Right, true)
+    let (left_by, fraction) = if remote_x < 0.0 {
+        (Edge::Left, remote_y / max_y.max(1.0))
     } else if remote_x > max_x {
-        (Edge::Left, true)
+        (Edge::Right, remote_y / max_y.max(1.0))
     } else if remote_y < 0.0 {
-        (Edge::Bottom, false)
+        (Edge::Top, remote_x / max_x.max(1.0))
     } else if remote_y > max_y {
-        (Edge::Top, false)
+        (Edge::Bottom, remote_x / max_x.max(1.0))
     } else {
         return None;
     };
+    let fraction = fraction.clamp(0.0, 1.0);
 
-    // Where along the shared edge the cursor left, in layout coordinates.
-    let exit_along = if horizontal_exit {
-        remote.y as f64 + remote_y
-    } else {
-        remote.x as f64 + remote_x
-    };
-
+    // Only links attached to the side the cursor actually left by. Several may
+    // share that side, each covering a stretch of it.
     let candidates = targets
         .iter()
-        .filter(|target| target.edge == wanted && target.screen_id == screen_id);
+        .filter(|target| target.remote_edge == left_by && target.screen_id == screen_id);
 
-    // Prefer the screen that actually spans the exit point; if the cursor left
-    // past the end of every candidate, fall back to the nearest so it still
-    // comes home instead of being stranded.
+    // Prefer the link whose stretch covers the exit point; if the cursor left
+    // past the end of every one, fall back to the nearest so it still comes
+    // home instead of being stranded on the remote machine.
     let chosen = candidates.min_by(|a, b| {
         let distance = |target: &InputTarget| {
-            let screen = &target.layout_local_screen;
-            let (start, extent) = if horizontal_exit {
-                (screen.y as f64, screen.height as f64)
-            } else {
-                (screen.x as f64, screen.width as f64)
-            };
-            if exit_along < start {
-                start - exit_along
-            } else if exit_along > start + extent {
-                exit_along - (start + extent)
+            if fraction < target.remote_span.start {
+                target.remote_span.start - fraction
+            } else if fraction > target.remote_span.end {
+                fraction - target.remote_span.end
             } else {
                 0.0
             }
@@ -1799,34 +1869,16 @@ fn linux_exit_return<'a>(
             .unwrap_or(std::cmp::Ordering::Equal)
     })?;
 
-    let layout_local = &chosen.layout_local_screen;
+    let position = chosen.remote_span.position_of(fraction);
+    let local_fraction = chosen.local_span.fraction_at(position);
     let native_local = &chosen.local_screen;
+    let (offset_x, offset_y) = edge_entry_point(native_local, chosen.edge, local_fraction);
 
-    let point = if horizontal_exit {
-        let offset =
-            (exit_along - layout_local.y as f64).clamp(0.0, (layout_local.height - 1).max(1) as f64);
-        let native_y = native_local.y as f64
-            + linux_scale_axis(offset, layout_local.height, native_local.height);
-        let native_x = if matches!(chosen.edge, Edge::Right) {
-            (native_local.x + native_local.width - 2) as f64
-        } else {
-            (native_local.x + 1) as f64
-        };
-        (native_x, native_y)
-    } else {
-        let offset =
-            (exit_along - layout_local.x as f64).clamp(0.0, (layout_local.width - 1).max(1) as f64);
-        let native_x = native_local.x as f64
-            + linux_scale_axis(offset, layout_local.width, native_local.width);
-        let native_y = if matches!(chosen.edge, Edge::Bottom) {
-            (native_local.y + native_local.height - 2) as f64
-        } else {
-            (native_local.y + 1) as f64
-        };
-        (native_x, native_y)
-    };
-
-    Some((chosen, point.0, point.1))
+    Some((
+        chosen,
+        native_local.x as f64 + offset_x,
+        native_local.y as f64 + offset_y,
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -1911,53 +1963,85 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         .find(|device| device.role == "local")
         .or_else(|| native_layout.devices.first());
 
-    let local_screens = &local_device.screens;
     let origin_device_id = crate::local_peer_from_layout(layout).id;
     let mut targets = Vec::new();
 
-    for device in layout.devices.iter().filter(|device| {
-        device.role != "local"
-            && device.online
-            && device.input_ready
-            && device.protocol_version == quic_transport::PROTOCOL_VERSION
-            && !device.transport_public_key.trim().is_empty()
-    }) {
-        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
-        for layout_local_screen in local_screens {
-            let native_local_screen = native_device
-                .and_then(|device| {
-                    device
-                        .screens
-                        .iter()
-                        .find(|screen| screen.id == layout_local_screen.id)
-                })
-                .unwrap_or(layout_local_screen);
-            let native_local_screen = platform_native_screen(native_local_screen);
-
-            for remote_screen in &device.screens {
-                if screens_overlap(layout_local_screen, remote_screen) {
-                    continue;
-                }
-
-                if let Some(edge) = touching_edge(layout_local_screen, remote_screen) {
-                    targets.push(InputTarget {
-                        device_id: device.id.clone(),
-                        origin_device_id: origin_device_id.clone(),
-                        cluster_id: layout.cluster_id.clone(),
-                        pair_secret: layout.pair_secret.clone(),
-                        target_addr: format!("{}:{}", device.host, quic_port),
-                        target_platform: device.platform.clone(),
-                        transport_public_key: device.transport_public_key.clone(),
-                        protocol_version: device.protocol_version,
-                        screen_id: peer_screen_id(device, remote_screen),
-                        local_screen: native_local_screen.clone(),
-                        layout_local_screen: layout_local_screen.clone(),
-                        remote_screen: remote_screen.clone(),
-                        edge,
-                    });
-                }
-            }
+    for link in effective_edge_links(layout) {
+        // A link is usable only if exactly one end is ours; two local screens
+        // wired together is not something capture can act on, and neither is a
+        // link between two remote devices.
+        let (local_anchor, remote_anchor) = if link.a.device_id == local_device.id {
+            (&link.a, &link.b)
+        } else if link.b.device_id == local_device.id {
+            (&link.b, &link.a)
+        } else {
+            continue;
+        };
+        if remote_anchor.device_id == local_device.id {
+            continue;
         }
+
+        let Some(edge) = Edge::from_side(&local_anchor.side) else {
+            continue;
+        };
+        let Some(remote_edge) = Edge::from_side(&remote_anchor.side) else {
+            continue;
+        };
+        let Some(layout_local_screen) = local_device
+            .screens
+            .iter()
+            .find(|screen| screen.id == local_anchor.screen_id)
+        else {
+            continue;
+        };
+
+        let Some(device) = layout.devices.iter().find(|device| {
+            device.id == remote_anchor.device_id
+                && device.role != "local"
+                && device.online
+                && device.input_ready
+                && device.protocol_version == quic_transport::PROTOCOL_VERSION
+                && !device.transport_public_key.trim().is_empty()
+        }) else {
+            continue;
+        };
+        let Some(remote_screen) = device
+            .screens
+            .iter()
+            .find(|screen| screen.id == remote_anchor.screen_id)
+        else {
+            continue;
+        };
+
+        let native_local_screen = native_device
+            .and_then(|device| {
+                device
+                    .screens
+                    .iter()
+                    .find(|screen| screen.id == layout_local_screen.id)
+            })
+            .unwrap_or(layout_local_screen);
+        let native_local_screen = platform_native_screen(native_local_screen);
+        let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+
+        targets.push(InputTarget {
+            device_id: device.id.clone(),
+            origin_device_id: origin_device_id.clone(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            target_addr: format!("{}:{}", device.host, quic_port),
+            target_platform: device.platform.clone(),
+            transport_public_key: device.transport_public_key.clone(),
+            protocol_version: device.protocol_version,
+            screen_id: peer_screen_id(device, remote_screen),
+            local_screen: native_local_screen.clone(),
+            layout_local_screen: layout_local_screen.clone(),
+            remote_screen: remote_screen.clone(),
+            edge,
+            local_span: EdgeSpan::from_anchor(local_anchor),
+            remote_edge,
+            remote_span: EdgeSpan::from_anchor(remote_anchor),
+        });
     }
 
     targets
@@ -2010,6 +2094,103 @@ fn invalidate_input_targets_cache() {
     if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
         *cache = None;
     }
+}
+
+/// The edge wiring in force: what the user drew, or — for a layout saved before
+/// the edge editor existed — what their screen arrangement implies.
+///
+/// Once `edge_links` is `Some`, it is the whole truth. An empty list therefore
+/// routes nothing, which is a legitimate thing to ask for; only `None` falls
+/// back to geometry, so upgrading MyKVM never silently rewires a working desk.
+fn effective_edge_links(layout: &LayoutState) -> Vec<EdgeLink> {
+    match &layout.edge_links {
+        Some(links) => links.clone(),
+        None => edge_links_from_geometry(layout),
+    }
+}
+
+/// The stretch two adjacent screens actually share along `edge`, as a fraction
+/// of each screen's own side.
+///
+/// This is what makes a seeded link behave like the geometry it came from: the
+/// laptop's three panels under one 4K edge each get the third of that edge they
+/// physically sit under, rather than all three claiming the whole of it.
+fn geometric_spans(local: &Screen, remote: &Screen, edge: Edge) -> Option<(EdgeSpan, EdgeSpan)> {
+    let (local_start, local_extent, remote_start, remote_extent) = if edge.runs_horizontally() {
+        (local.x, local.width, remote.x, remote.width)
+    } else {
+        (local.y, local.height, remote.y, remote.height)
+    };
+
+    let overlap_start = local_start.max(remote_start);
+    let overlap_end = (local_start + local_extent).min(remote_start + remote_extent);
+    if overlap_end <= overlap_start {
+        return None;
+    }
+
+    let span = |start: i32, extent: i32| EdgeSpan {
+        start: ((overlap_start - start) as f64 / extent.max(1) as f64).clamp(0.0, 1.0),
+        end: ((overlap_end - start) as f64 / extent.max(1) as f64).clamp(0.0, 1.0),
+    };
+
+    Some((
+        span(local_start, local_extent),
+        span(remote_start, remote_extent),
+    ))
+}
+
+/// Derives links from where the screens sit, reproducing the behaviour that
+/// predates the editor. Also seeds the editor, so it opens showing the wiring
+/// the user already has instead of a blank slate.
+pub fn edge_links_from_geometry(layout: &LayoutState) -> Vec<EdgeLink> {
+    let Some(local_device) = layout.devices.iter().find(|device| device.role == "local") else {
+        return Vec::new();
+    };
+
+    let mut links = Vec::new();
+    for device in layout.devices.iter().filter(|device| device.role != "local") {
+        for local_screen in &local_device.screens {
+            for remote_screen in &device.screens {
+                if screens_overlap(local_screen, remote_screen) {
+                    continue;
+                }
+                let Some(edge) = touching_edge(local_screen, remote_screen) else {
+                    continue;
+                };
+
+                let Some((local_span, remote_span)) =
+                    geometric_spans(local_screen, remote_screen, edge)
+                else {
+                    continue;
+                };
+
+                links.push(EdgeLink {
+                    id: format!(
+                        "geometry:{}:{}:{}",
+                        local_screen.id,
+                        edge.as_side(),
+                        remote_screen.id
+                    ),
+                    a: EdgeAnchor {
+                        device_id: local_device.id.clone(),
+                        screen_id: local_screen.id.clone(),
+                        side: edge.as_side().into(),
+                        start: local_span.start,
+                        end: local_span.end,
+                    },
+                    b: EdgeAnchor {
+                        device_id: device.id.clone(),
+                        screen_id: remote_screen.id.clone(),
+                        side: edge.opposite().as_side().into(),
+                        start: remote_span.start,
+                        end: remote_span.end,
+                    },
+                });
+            }
+        }
+    }
+
+    links
 }
 
 fn touching_edge(local: &Screen, remote: &Screen) -> Option<Edge> {
@@ -4402,6 +4583,63 @@ fn handle_macos_mouse_move(
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Where along a screen's side a point sits, as a fraction of that side.
+fn side_fraction(screen: &Screen, edge: Edge, x: f64, y: f64) -> f64 {
+    let (value, start, extent) = if edge.runs_horizontally() {
+        (x, screen.x as f64, screen.width.max(1) as f64)
+    } else {
+        (y, screen.y as f64, screen.height.max(1) as f64)
+    };
+    ((value - start) / extent).clamp(0.0, 1.0)
+}
+
+/// The point on a screen's side at `fraction`, one pixel inside it, relative to
+/// the screen's own origin.
+///
+/// One pixel rather than zero so the cursor lands *on* the screen: a receiving
+/// Windows box clamps to the desktop, and a coordinate exactly on the boundary
+/// can round onto the neighbouring monitor.
+fn edge_entry_point(screen: &Screen, edge: Edge, fraction: f64) -> (f64, f64) {
+    edge_entry_point_pushed(screen, edge, fraction, 0.0)
+}
+
+/// As `edge_entry_point`, but carrying `push` pixels of the movement that
+/// caused the crossing further into the screen.
+///
+/// A fast flick at the edge is a single large delta. Dropping it and placing
+/// the cursor exactly one pixel in makes the pointer feel stuck at the border
+/// for a frame before it catches up.
+fn edge_entry_point_pushed(screen: &Screen, edge: Edge, fraction: f64, push: f64) -> (f64, f64) {
+    let max_x = (screen.width - 1).max(0) as f64;
+    let max_y = (screen.height - 1).max(0) as f64;
+    let along = fraction.clamp(0.0, 1.0);
+    let inward = 1.0 + push.abs();
+
+    match edge {
+        Edge::Top => (along * max_x, inward.min(max_y)),
+        Edge::Bottom => (along * max_x, (max_y - inward).max(0.0)),
+        Edge::Left => (inward.min(max_x), along * max_y),
+        Edge::Right => ((max_x - inward).max(0.0), along * max_y),
+    }
+}
+
+/// Maps a crossing on the local side of a link onto the remote side of it.
+///
+/// Both spans are stretched to each other, so a link between a 900 px stretch
+/// and a full 1920 px side still walks the cursor across the whole of the
+/// latter — the two desks need not be the same size.
+fn link_entry_point(target: &InputTarget, layout_x: f64, layout_y: f64, push: f64) -> (f64, f64) {
+    let fraction = side_fraction(&target.layout_local_screen, target.edge, layout_x, layout_y);
+    let position = target.local_span.position_of(fraction);
+    let remote_fraction = target.remote_span.fraction_at(position);
+    edge_entry_point_pushed(
+        &target.remote_screen,
+        target.remote_edge,
+        remote_fraction,
+        push,
+    )
+}
+
 fn crossing_target(
     targets: &[InputTarget],
     x: f64,
@@ -4430,24 +4668,21 @@ fn crossing_target_with_transform(
             crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
-            let entry_dx = dx * target.layout_local_screen.width.max(1) as f64
-                / target.local_screen.width.max(1) as f64;
-            let entry_dy = dy * target.layout_local_screen.height.max(1) as f64
-                / target.local_screen.height.max(1) as f64;
-            let remote_x = match target.edge {
-                Edge::Right => 1.0 + entry_dx.max(0.0),
-                Edge::Left => (target.remote_screen.width - 2) as f64 + entry_dx.min(0.0),
-                _ => (mapped_x - target.remote_screen.x as f64)
-                    .clamp(0.0, (target.remote_screen.width - 1) as f64),
-            }
-            .clamp(0.0, (target.remote_screen.width - 1) as f64);
-            let remote_y = match target.edge {
-                Edge::Bottom => 1.0 + entry_dy.max(0.0),
-                Edge::Top => (target.remote_screen.height - 2) as f64 + entry_dy.min(0.0),
-                _ => (mapped_y - target.remote_screen.y as f64)
-                    .clamp(0.0, (target.remote_screen.height - 1) as f64),
-            }
-            .clamp(0.0, (target.remote_screen.height - 1) as f64);
+            // The link decides where this lands. Both ends carry which side and
+            // which stretch of it they occupy, so the entry point follows from
+            // the crossing position alone — no inference from where the two
+            // screens happen to sit relative to each other.
+            // How far past the edge the movement carried, in layout pixels.
+            let push = if target.edge.runs_horizontally() {
+                dy * target.layout_local_screen.height.max(1) as f64
+                    / target.local_screen.height.max(1) as f64
+            } else {
+                dx * target.layout_local_screen.width.max(1) as f64
+                    / target.local_screen.width.max(1) as f64
+            };
+            let (remote_x, remote_y) = link_entry_point(target, mapped_x, mapped_y, push);
+            let remote_x = remote_x.clamp(0.0, (target.remote_screen.width - 1) as f64);
+            let remote_y = remote_y.clamp(0.0, (target.remote_screen.height - 1) as f64);
 
             // The screen we cross into is the entry screen; carry it (with its
             // wire id) as the initial "current" screen so the cursor can later
@@ -6631,6 +6866,22 @@ mod tests {
         }
     }
 
+    /// Fills a fixture's link spans from where its two screens sit, the same
+    /// way a layout saved before the edge editor is seeded. Fixtures describe
+    /// geometry, so this keeps them describing geometry.
+    fn wired_by_geometry(mut target: InputTarget) -> InputTarget {
+        if let Some((local_span, remote_span)) = geometric_spans(
+            &target.layout_local_screen,
+            &target.remote_screen,
+            target.edge,
+        ) {
+            target.local_span = local_span;
+            target.remote_span = remote_span;
+        }
+        target.remote_edge = target.edge.opposite();
+        target
+    }
+
     fn target_for_coordinate_tests() -> InputTarget {
         InputTarget {
             device_id: "peer-device".into(),
@@ -6660,6 +6911,9 @@ mod tests {
                 1440,
             ),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         }
     }
 
@@ -6730,6 +6984,7 @@ mod tests {
             modifier_map: crate::default_modifier_map(),
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
+            edge_links: None,
         }
     }
 
@@ -6778,6 +7033,9 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         };
         let mut current_screen = entry.clone();
         current_screen.id = "scr-1".into();
@@ -6833,6 +7091,9 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         };
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
@@ -6881,6 +7142,9 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         };
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
@@ -7247,6 +7511,9 @@ mod tests {
                 layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
                 remote_screen: entry.clone(),
                 edge,
+                local_span: EdgeSpan::whole(),
+                remote_edge: edge.opposite(),
+                remote_span: EdgeSpan::whole(),
             };
             let mut current_screen = entry.clone();
             current_screen.id = "local-display-1".into();
@@ -7741,6 +8008,9 @@ mod tests {
                 1117,
             ),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         };
 
         assert!(crossing_layout_point(&target, 1918.0, 600.0, 5.0, 0.0).is_none());
@@ -7777,6 +8047,9 @@ mod tests {
                 1117,
             ),
             edge: Edge::Right,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Left,
+            remote_span: EdgeSpan::whole(),
         };
 
         assert!(crossing_layout_point(&target, 3838.0, 1200.0, 900.0, 0.0).is_none());
@@ -8029,12 +8302,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn targets_for_exit_tests() -> (Screen, Vec<InputTarget>) {
         let remote = screen("peer-device", "remote-1", 179, 0, 1920, 1080);
-        let make = |name: &str, edge: Edge, x: i32, y: i32, w: i32, h: i32| InputTarget {
-            edge,
-            local_screen: screen("local-device", name, x, y, w, h),
-            layout_local_screen: screen("local-device", name, x, y, w, h),
-            remote_screen: remote.clone(),
-            ..target_for_coordinate_tests()
+        let make = |name: &str, edge: Edge, x: i32, y: i32, w: i32, h: i32| {
+            wired_by_geometry(InputTarget {
+                edge,
+                local_screen: screen("local-device", name, x, y, w, h),
+                layout_local_screen: screen("local-device", name, x, y, w, h),
+                remote_screen: remote.clone(),
+                ..target_for_coordinate_tests()
+            })
         };
 
         let targets = vec![
@@ -8051,14 +8326,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn targets_for_entry_tests() -> Vec<InputTarget> {
         let local = screen("local-device", "dp-3", 1200, 1080, 3840, 2160);
-        let make = |name: &str, x: i32, w: i32| InputTarget {
+        let make = |name: &str, x: i32, w: i32| wired_by_geometry(InputTarget {
             edge: Edge::Bottom,
             local_screen: local.clone(),
             layout_local_screen: local.clone(),
             remote_screen: screen("peer-device", name, x, 3240, w, 1080),
             screen_id: name.into(),
             ..target_for_coordinate_tests()
-        };
+        });
 
         vec![
             make("display-9", 2200, 1920),
@@ -8089,22 +8364,28 @@ mod tests {
         // target won and the entry point was computed for a left crossing.
         let windows = screen("peer-win", "display-1", 179, 0, 1920, 1080);
 
-        let up_off_dp1 = InputTarget {
+        let up_off_dp1 = wired_by_geometry(InputTarget {
             edge: Edge::Top,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Bottom,
+            remote_span: EdgeSpan::whole(),
             local_screen: screen("local-device", "dp-1", 0, 1080, 1200, 1920),
             layout_local_screen: screen("local-device", "dp-1", 0, 1080, 1200, 1920),
             remote_screen: windows.clone(),
             screen_id: "display-1".into(),
             ..target_for_coordinate_tests()
-        };
-        let left_off_hdmi = InputTarget {
+        });
+        let left_off_hdmi = wired_by_geometry(InputTarget {
             edge: Edge::Left,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Right,
+            remote_span: EdgeSpan::whole(),
             local_screen: screen("local-device", "hdmi-a-1", 2219, 0, 1920, 1080),
             layout_local_screen: screen("local-device", "hdmi-a-1", 2099, 0, 1920, 1080),
             remote_screen: windows,
             screen_id: "display-1".into(),
             ..target_for_coordinate_tests()
-        };
+        });
 
         // Order matters: the left-edge target is listed first, so a tie on
         // distance used to hand it the crossing.
@@ -8122,6 +8403,77 @@ mod tests {
         // is the screen's own offset.
         assert_eq!(active.x.round() as i32, 89);
         assert!(active.y >= 1070.0, "entered at y={}", active.y);
+    }
+
+    #[test]
+    fn a_link_may_join_sides_that_do_not_face_each_other() {
+        // The whole point of explicit links: the laptop sits below the desk but
+        // its screen is wired to arrive at its *bottom* edge, which no
+        // arrangement of rectangles could express.
+        let local = screen("local-device", "dp-1", 0, 1080, 1200, 1920);
+        let remote = screen("peer-device", "display-10", 280, 3240, 1920, 1080);
+        let target = InputTarget {
+            edge: Edge::Bottom,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Bottom,
+            remote_span: EdgeSpan::whole(),
+            local_screen: local.clone(),
+            layout_local_screen: local,
+            remote_screen: remote.clone(),
+            screen_id: "display-10".into(),
+            ..target_for_coordinate_tests()
+        };
+
+        // Halfway along the local bottom edge maps to halfway along the remote
+        // bottom edge, and lands near the bottom of it rather than the top.
+        let (x, y) = link_entry_point(&target, 600.0, 3000.0, 0.0);
+        assert_eq!(x.round() as i32, 960);
+        assert!(y > 1070.0, "entered at y={y}, expected near the bottom edge");
+    }
+
+    #[test]
+    fn one_side_split_between_two_destinations_routes_by_position() {
+        let local = screen("local-device", "dp-3", 1200, 1080, 3840, 2160);
+        let make = |name: &str, start: f64, end: f64| InputTarget {
+            edge: Edge::Bottom,
+            local_span: EdgeSpan { start, end },
+            remote_edge: Edge::Top,
+            remote_span: EdgeSpan::whole(),
+            local_screen: local.clone(),
+            layout_local_screen: local.clone(),
+            remote_screen: screen("peer-device", name, 0, 3240, 1920, 1080),
+            screen_id: name.into(),
+            ..target_for_coordinate_tests()
+        };
+        // The left third goes to one machine, the right two thirds to another.
+        let targets = vec![make("left-third", 0.0, 1.0 / 3.0), make("rest", 1.0 / 3.0, 1.0)];
+
+        let left = linux_entry_target(&targets, 1500.0, 3240.0).expect("left third matches");
+        assert_eq!(left.screen_id, "left-third");
+
+        let right = linux_entry_target(&targets, 4500.0, 3240.0).expect("right stretch matches");
+        assert_eq!(right.screen_id, "rest");
+
+        // A stretch shorter than the destination still walks the whole of it:
+        // the far end of the left third arrives at the far end of that screen.
+        let (x, _) = link_entry_point(&targets[0], 1200.0 + 3840.0 / 3.0 - 1.0, 3240.0, 0.0);
+        assert!(x > 1900.0, "expected the far edge of the screen, got {x}");
+    }
+
+    #[test]
+    fn clearing_every_link_disables_handover_but_no_links_field_keeps_geometry() {
+        let mut layout = layout_for_target_tests();
+
+        // A layout saved before the editor existed carries no links and must
+        // keep working off its geometry.
+        assert!(layout.edge_links.is_none());
+        let seeded = build_input_targets(&layout, &layout);
+        assert!(!seeded.is_empty(), "geometry should still route");
+
+        // Deliberately clearing every link routes nothing — that is a choice
+        // the user can make, not a layout we should second-guess.
+        layout.edge_links = Some(Vec::new());
+        assert!(build_input_targets(&layout, &layout).is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -8259,6 +8611,9 @@ mod tests {
         let remote = screen("peer-device", "remote-1", 0, 0, 1920, 1080);
         let target = InputTarget {
             edge: Edge::Top,
+            local_span: EdgeSpan::whole(),
+            remote_edge: Edge::Bottom,
+            remote_span: EdgeSpan::whole(),
             layout_local_screen: screen("local-device", "scaled", 0, 1080, 1920, 1080),
             local_screen: screen("local-device", "scaled", 5000, 2000, 3840, 2160),
             remote_screen: remote.clone(),
