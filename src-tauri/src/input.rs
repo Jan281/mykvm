@@ -1661,7 +1661,19 @@ fn start_platform_capture(
                 ready.failed_barriers,
                 ready.zones
             );
-            if ready.accepted_barriers == 0 {
+            if ready.accepted_barriers == 0 && !blocked_edges.is_empty() {
+                // Every link the user drew lands on an edge KDE will not guard.
+                // That is a wiring choice to revisit, not a malfunction — and
+                // reporting it as an error put a modal in front of the editor
+                // needed to change it.
+                NativeStageStatus {
+                    state: "ready".into(),
+                    detail: format!(
+                        "No screen edge could be armed.{} Until then the mouse stays on this machine.",
+                        blocked_note
+                    ),
+                }
+            } else if ready.accepted_barriers == 0 {
                 NativeStageStatus {
                     state: "error".into(),
                     detail: format!(

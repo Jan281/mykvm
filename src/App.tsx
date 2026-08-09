@@ -232,6 +232,10 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // The runtime reason already shown, so a persistent one is not re-raised on
+  // every poll. Cleared when the condition goes away, so it can speak up again
+  // if it comes back.
+  const reportedRuntimeErrorRef = useRef<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
@@ -558,11 +562,24 @@ function App() {
           // Keep a persistent blocking condition visible. The inject stage holds
           // the receiver-side reason keys/clicks get dropped (macOS Accessibility
           // missing, or Secure Keyboard Entry on); it is otherwise never shown.
+          // Raise it once per distinct reason. This poll runs every two
+          // seconds, and a condition that persists — a screen edge the
+          // compositor will not guard, say — used to reopen the dialog as fast
+          // as it could be dismissed, locking the user out of the very editor
+          // they needed to fix it.
           if (nextRuntime.started) {
-            if (nextRuntime.capture.state === "error") {
-              setErrorMessage(nextRuntime.capture.detail);
-            } else if (nextRuntime.inject.state === "error") {
-              setErrorMessage(nextRuntime.inject.detail);
+            const reason =
+              nextRuntime.capture.state === "error"
+                ? nextRuntime.capture.detail
+                : nextRuntime.inject.state === "error"
+                  ? nextRuntime.inject.detail
+                  : null;
+
+            if (reason !== reportedRuntimeErrorRef.current) {
+              reportedRuntimeErrorRef.current = reason;
+              if (reason) {
+                setErrorMessage(reason);
+              }
             }
           }
         })
@@ -1277,6 +1294,7 @@ function App() {
     screen: FlattenedScreen,
     side: EdgeSide,
     segment: SideSegment,
+    blocker: Screen | null,
   ) {
     setEdgeNotice(null);
 
@@ -1284,6 +1302,13 @@ function App() {
     if (segment.link) {
       updateEdgeLinks((links) => removeLink(links, segment.link!.id));
       setPendingAnchor(null);
+      return;
+    }
+
+    // Refuse to wire an edge the compositor will not guard. The link would look
+    // right in the editor and simply never fire.
+    if (blocker) {
+      setEdgeNotice(`${ui.layout.edgesBlockedByCompositor} (${blocker.name})`);
       return;
     }
 
@@ -2423,7 +2448,7 @@ function App() {
                                           : ui.layout.edgesHint
                                     }
                                     onClick={() =>
-                                      handleSegmentClick(screen, side, segment)
+                                      handleSegmentClick(screen, side, segment, blocker)
                                     }
                                     onDoubleClick={(event) =>
                                       handleSegmentSplit(event, screen, side)
