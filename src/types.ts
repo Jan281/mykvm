@@ -6,6 +6,8 @@ export type AppLanguage = 'cn' | 'en' | 'de'
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
+export type LogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
+
 export type TransportPortMode = 'auto' | 'fixed'
 
 export type ModifierTarget = 'control' | 'alt' | 'meta' | 'same'
@@ -114,4 +116,6 @@ export interface LayoutState {
    * taken over, and only what is linked hands over — an empty array included.
    */
   edgeLinks: EdgeLink[] | null
+  /** How much detail goes into the log file. 'debug' enables per-event traces. */
+  logLevel: LogLevel
 }

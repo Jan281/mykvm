@@ -71,6 +71,8 @@ export const TEXT = {
       screenSwitchRecording: "按下快捷键...",
       screenSwitchCopy:
         "仅服务端注册。按方向快捷键把控制权切到对应方向的相邻客户端；控制远端时再按任意切屏快捷键切回本机。",
+      logLevel: "日志级别",
+      logLevelHint: "debug 会记录每个输入事件，仅用于排查问题。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -323,6 +325,8 @@ export const TEXT = {
       screenSwitchRecording: "Press shortcut...",
       screenSwitchCopy:
         "Registered only on the server. Press a direction shortcut to jump to an adjacent client; while controlling a peer, press any quick-switch shortcut again to return to this machine.",
+      logLevel: "Log level",
+      logLevelHint: "debug records every input event — for troubleshooting only.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",
@@ -575,6 +579,8 @@ export const TEXT = {
       screenSwitchRecording: "Tastenkürzel drücken …",
       screenSwitchCopy:
         "Wird nur auf dem Server registriert. Mit einem Richtungskürzel springst du zum benachbarten Client; während du ein anderes Gerät steuerst, bringt dich ein beliebiges Wechselkürzel zurück auf diesen Rechner.",
+      logLevel: "Protokollstufe",
+      logLevelHint: "debug protokolliert jedes Eingabeereignis — nur zur Fehlersuche.",
       appearanceTitle: "Konfiguration",
       language: "Sprache",
       simplifiedChinese: "cn 中文简体",

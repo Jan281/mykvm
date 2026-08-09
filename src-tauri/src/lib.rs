@@ -282,6 +282,10 @@ struct LayoutState {
     /// `Some(vec![])`, which deliberately routes nothing.
     #[serde(default)]
     edge_links: Option<Vec<EdgeLink>>,
+    /// How much detail goes into the log file. "debug" turns on the per-event
+    /// diagnostics that are otherwise too noisy to leave on.
+    #[serde(default = "default_log_level")]
+    log_level: String,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -1368,6 +1372,7 @@ fn save_layout(
         let previous_layout = stored_layout.clone();
         let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
         write_layout_to_disk(&state.config_path, &saved_layout)?;
+        apply_log_level(&saved_layout.log_level);
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
     };
@@ -2954,7 +2959,9 @@ pub fn run() {
             }
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(log::LevelFilter::Info)
+                    // Ceiling only. The effective level is set from the saved
+                    // setting right after, and whenever the user changes it.
+                    .level(log::LevelFilter::Trace)
                     .max_file_size(LOG_MAX_FILE_SIZE_BYTES)
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                     .build(),
@@ -2981,6 +2988,8 @@ pub fn run() {
                 detected_layout,
             );
             app.manage(runtime);
+            // The saved level takes over from the plugin's permissive ceiling.
+            apply_log_level(&app.state::<AppRuntime>().layout_snapshot().log_level);
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -3947,6 +3956,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
 
     LayoutState {
         edge_links: None,
+        log_level: default_log_level(),
         active_device_id: device_id.clone(),
         selected_screen_id,
         input_mode: default_input_mode(),
@@ -3991,6 +4001,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
 fn detect_fallback_layout() -> LayoutState {
     LayoutState {
         edge_links: None,
+        log_level: default_log_level(),
         devices: Vec::new(),
         active_device_id: String::new(),
         selected_screen_id: String::new(),
@@ -4108,6 +4119,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         // Carried straight through: routing the user drew is theirs to keep,
         // and `None` here is what keeps a pre-editor layout on geometry.
         edge_links: saved_layout.edge_links.clone(),
+        log_level: saved_layout.log_level.clone(),
         devices,
         active_device_id,
         selected_screen_id,
@@ -4366,6 +4378,22 @@ fn default_start_minimized() -> bool {
 
 fn default_edge_anchor_end() -> f64 {
     1.0
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+/// The log plugin is built once with a permissive ceiling; this is what
+/// actually decides how much is written, and it can change at any time.
+fn apply_log_level(level: &str) {
+    log::set_max_level(match level {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    });
 }
 
 fn default_transport_port_mode() -> String {
@@ -5692,7 +5720,73 @@ fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
         .unwrap_or_default()
 }
 
+/// Renames a device and everything that refers to it by id.
+///
+/// Screen ids carry the device id as a prefix, and the edge wiring names both,
+/// so a rename that touched only the device would strand the user's links on
+/// ids nothing answers to any more.
+fn rename_device_in_layout(layout: &mut LayoutState, old_id: &str, new_id: &str) {
+    let old_prefix = format!("{old_id}-");
+    let new_prefix = format!("{new_id}-");
+    let rename_screen = |id: &str| -> String {
+        id.strip_prefix(&old_prefix)
+            .map(|rest| format!("{new_prefix}{rest}"))
+            .unwrap_or_else(|| id.to_string())
+    };
+
+    for device in layout.devices.iter_mut().filter(|device| device.id == old_id) {
+        device.id = new_id.to_string();
+        for screen in &mut device.screens {
+            screen.id = rename_screen(&screen.id);
+            screen.device_id = new_id.to_string();
+        }
+    }
+
+    if let Some(links) = layout.edge_links.as_mut() {
+        for link in links.iter_mut() {
+            for anchor in [&mut link.a, &mut link.b] {
+                if anchor.device_id == old_id {
+                    anchor.device_id = new_id.to_string();
+                    anchor.screen_id = rename_screen(&anchor.screen_id);
+                }
+            }
+        }
+    }
+
+    if layout.active_device_id == old_id {
+        layout.active_device_id = new_id.to_string();
+    }
+    layout.selected_screen_id = rename_screen(&layout.selected_screen_id);
+
+    log::info!("[peer] device id rotated: {old_id} -> {new_id}");
+}
+
 fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
+    // A peer's id encodes the address it was first seen at, so one that has
+    // since moved announces a different id. Adopt it before anything else.
+    //
+    // Every input packet names its target by id, and the receiver compares that
+    // against the id it derives from its *own* current address — a stale one is
+    // dropped without a word. From this side that is indistinguishable from
+    // working: the peer is online, paired, input-ready, and every packet
+    // reports as sent, while nothing whatsoever happens over there.
+    let cluster_id = layout.cluster_id.clone();
+    let renames: Vec<(String, String)> = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .filter_map(|device| {
+            let peer = peers
+                .iter()
+                .find(|peer| device_matches_peer(device, peer, &cluster_id))?;
+            let announced = peer_device_id(peer);
+            (announced != device.id).then(|| (device.id.clone(), announced))
+        })
+        .collect();
+    for (old_id, new_id) in renames {
+        rename_device_in_layout(layout, &old_id, &new_id);
+    }
+
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
     let cluster_id = layout.cluster_id.clone();
@@ -7098,6 +7192,7 @@ mod tests {
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
             edge_links: None,
+            log_level: default_log_level(),
         }
     }
 
@@ -7236,6 +7331,63 @@ mod tests {
         assert!(layout.devices[1].online);
         assert!(layout.devices[1].input_ready);
         assert_eq!(layout.devices[1].transport_public_key, "rotated-client-key");
+    }
+
+    #[test]
+    fn peer_presence_adopts_the_id_a_moved_peer_announces() {
+        // Regression: a peer's id encodes the address it was first seen at, and
+        // presence refreshed everything *but* the id. Packets kept naming the
+        // old one, the receiver compared it against the id derived from its
+        // current address and dropped every single one without logging — while
+        // this side reported the peer online, paired and every packet sent.
+        let mut layout = test_layout();
+        let old_id = layout.devices[1].id.clone();
+        let screen_id = format!("{old_id}-local-display-1");
+        layout.devices[1].screens = vec![Screen {
+            id: screen_id.clone(),
+            device_id: old_id.clone(),
+            name: "DISPLAY9".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1200,
+            scale: 1.0,
+            is_primary: true,
+        }];
+        layout.edge_links = Some(vec![EdgeLink {
+            id: "link-1".into(),
+            a: EdgeAnchor {
+                device_id: "local-device".into(),
+                screen_id: "local-display-1".into(),
+                side: "left".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+            b: EdgeAnchor {
+                device_id: old_id.clone(),
+                screen_id: screen_id.clone(),
+                side: "right".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+        }]);
+
+        let mut peer = test_peer();
+        peer.id = "peer-client-192-168-0-117".into();
+        apply_peer_presence(&mut layout, &[peer]);
+
+        assert_eq!(layout.devices[1].id, "peer-client-192-168-0-117");
+
+        // The wiring has to move with it, or the user's links point at ids
+        // nothing answers to any more.
+        let links = layout.edge_links.as_ref().expect("links survive the rename");
+        assert_eq!(links[0].b.device_id, "peer-client-192-168-0-117");
+        assert_eq!(
+            links[0].b.screen_id,
+            "peer-client-192-168-0-117-local-display-1"
+        );
+        // The local end is untouched.
+        assert_eq!(links[0].a.screen_id, "local-display-1");
     }
 
     #[test]

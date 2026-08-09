@@ -34,6 +34,7 @@ export const defaultLayout: LayoutState = {
   modifierMap: { control: 'meta', alt: 'same', meta: 'control' },
   edgeSwitchHotkey: 'alt+shift+k',
   edgeLinks: null,
+  logLevel: 'info',
   screenSwitchHotkeys: { left: 'alt+left', right: 'alt+right', up: 'alt+up', down: 'alt+down' },
   devices: [
     {

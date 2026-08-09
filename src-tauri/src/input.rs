@@ -7080,6 +7080,7 @@ mod tests {
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
             edge_links: None,
+            log_level: "info".into(),
         }
     }
 

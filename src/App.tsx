@@ -100,6 +100,7 @@ import type {
   LayoutState,
   MachineRole,
   ModifierMap,
+  LogLevel,
   ModifierTarget,
   Platform,
   Screen,
@@ -1593,6 +1594,13 @@ function App() {
     }));
   }
 
+  function setLogLevel(logLevel: LogLevel) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      logLevel,
+    }));
+  }
+
   function setThemeMode(themeMode: ThemeMode) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -2987,6 +2995,28 @@ function App() {
                     }
                   />
                 </div>
+              </section>
+
+              <section className="surface-card settings-card">
+                <h2>{ui.settings.diagnostics}</h2>
+                <div className="settings-control-row">
+                  <span>{ui.settings.logLevel}</span>
+                  <div className="segmented-control">
+                    {(["error", "warn", "info", "debug", "trace"] as LogLevel[]).map(
+                      (level) => (
+                        <button
+                          key={level}
+                          type="button"
+                          className={layout.logLevel === level ? "active" : ""}
+                          onClick={() => setLogLevel(level)}
+                        >
+                          {level}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                </div>
+                <p className="settings-hint">{ui.settings.logLevelHint}</p>
               </section>
 
               <section className="surface-card settings-card">
