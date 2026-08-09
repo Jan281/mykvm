@@ -47,6 +47,19 @@ import {
   writeClipboardText,
 } from "./desktopApi";
 import type { AppUpdateInfo } from "./desktopApi";
+import {
+  EDGE_SIDES,
+  clamp01,
+  connect,
+  edgeBlockedBy,
+  edgeLinksFromGeometry,
+  effectiveEdgeLinks,
+  removeLink,
+  sideRunsHorizontally,
+  sideSegments,
+  splitSide,
+} from "./edgeLinks";
+import type { SideSegment } from "./edgeLinks";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -76,6 +89,9 @@ import type {
 import type {
   AppLanguage,
   Device,
+  EdgeAnchor,
+  EdgeLink,
+  EdgeSide,
   LayoutState,
   MachineRole,
   ModifierMap,
@@ -1228,6 +1244,99 @@ function App() {
     }
   }
 
+  // Cuts the user has made but not yet wired. They live here rather than in the
+  // layout because an unconnected cut routes nothing — persisting it would save
+  // a decision that has no effect.
+  const [boardMode, setBoardMode] = useState<"screens" | "edges">("screens");
+  const [edgeCuts, setEdgeCuts] = useState<Record<string, number[]>>({});
+  const [pendingAnchor, setPendingAnchor] = useState<EdgeAnchor | null>(null);
+  const [edgeNotice, setEdgeNotice] = useState<string | null>(null);
+
+  const edgeLinks = useMemo(
+    () => (layout ? effectiveEdgeLinks(layout) : []),
+    [layout],
+  );
+  const localScreens = useMemo(
+    () => layout?.devices.find((device) => device.role === "local")?.screens ?? [],
+    [layout],
+  );
+
+  function cutsFor(screenId: string, side: EdgeSide) {
+    return edgeCuts[`${screenId}:${side}`] ?? [];
+  }
+
+  /** Writes the wiring, taking it over from geometry on the first edit. */
+  function updateEdgeLinks(mutator: (links: EdgeLink[]) => EdgeLink[]) {
+    updateLayout((current) => ({
+      ...current,
+      edgeLinks: mutator(effectiveEdgeLinks(current)),
+    }));
+  }
+
+  function handleSegmentClick(
+    screen: FlattenedScreen,
+    side: EdgeSide,
+    segment: SideSegment,
+  ) {
+    setEdgeNotice(null);
+
+    // Clicking a wired stretch breaks that link — the same gesture that made it.
+    if (segment.link) {
+      updateEdgeLinks((links) => removeLink(links, segment.link!.id));
+      setPendingAnchor(null);
+      return;
+    }
+
+    const anchor: EdgeAnchor = {
+      deviceId: screen.deviceId,
+      screenId: screen.id,
+      side,
+      start: segment.start,
+      end: segment.end,
+    };
+
+    if (!pendingAnchor) {
+      setPendingAnchor(anchor);
+      return;
+    }
+
+    if (pendingAnchor.screenId === anchor.screenId) {
+      setEdgeNotice(ui.layout.edgesSameScreen);
+      setPendingAnchor(anchor);
+      return;
+    }
+
+    updateEdgeLinks((links) => connect(links, pendingAnchor, anchor));
+    setPendingAnchor(null);
+  }
+
+  /** Double-click cuts a side where the pointer is, so it can feed two places. */
+  function handleSegmentSplit(
+    event: React.MouseEvent<HTMLButtonElement>,
+    screen: FlattenedScreen,
+    side: EdgeSide,
+  ) {
+    const strip = event.currentTarget.parentElement;
+    if (!strip) return;
+    const box = strip.getBoundingClientRect();
+    const fraction = sideRunsHorizontally(side)
+      ? (event.clientX - box.left) / Math.max(box.width, 1)
+      : (event.clientY - box.top) / Math.max(box.height, 1);
+
+    const { cut, blocked } = splitSide(edgeLinks, screen.id, side, clamp01(fraction));
+    if (blocked) {
+      setEdgeNotice(ui.layout.edgesSplitBlocked);
+      return;
+    }
+
+    setEdgeNotice(null);
+    const key = `${screen.id}:${side}`;
+    setEdgeCuts((current) => ({
+      ...current,
+      [key]: [...(current[key] ?? []), cut],
+    }));
+  }
+
   function boardRect(screen: Screen) {
     return {
       left:
@@ -1270,6 +1379,11 @@ function App() {
     screen: Screen,
   ) {
     event.preventDefault();
+    // Dragging a screen while wiring its edges would move the very thing being
+    // aimed at, so the rectangles hold still in edge mode.
+    if (boardMode === "edges") {
+      return;
+    }
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);
     setSnapshot((current) =>
@@ -2161,6 +2275,22 @@ function App() {
                 <h1>{ui.layout.title}</h1>
               </div>
               <div className="toolbar-actions">
+                <div className="board-mode-switch" role="group">
+                  <button
+                    type="button"
+                    className={boardMode === "screens" ? "active" : ""}
+                    onClick={() => setBoardMode("screens")}
+                  >
+                    {ui.layout.modeScreens}
+                  </button>
+                  <button
+                    type="button"
+                    className={boardMode === "edges" ? "active" : ""}
+                    onClick={() => setBoardMode("edges")}
+                  >
+                    {ui.layout.modeEdges}
+                  </button>
+                </div>
                 <span className={`status-pill ${isSaving ? "saving" : ""}`}>
                   {isSaving ? ui.common.saving : ui.common.synced}
                 </span>
@@ -2233,6 +2363,81 @@ function App() {
                   </button>
                 );
               })}
+
+              {boardMode === "edges"
+                ? screens.map((screen) => {
+                    const rect = boardRect(screen);
+                    const isLocal = screen.role === "local";
+
+                    return (
+                      <div
+                        key={`edges-${screen.id}`}
+                        className="screen-edges"
+                        style={{
+                          left: rect.left,
+                          top: rect.top,
+                          width: rect.width,
+                          height: rect.height,
+                        }}
+                      >
+                        {EDGE_SIDES.map((side) => {
+                          // Only our own screens can carry a barrier, so only
+                          // they can be blocked by a neighbour of ours.
+                          const blocker = isLocal
+                            ? edgeBlockedBy(screen, side, localScreens)
+                            : null;
+                          const segments = sideSegments(
+                            edgeLinks,
+                            screen.id,
+                            side,
+                            cutsFor(screen.id, side),
+                          );
+
+                          return (
+                            <div key={side} className={`edge-strip ${side}`}>
+                              {segments.map((segment) => {
+                                const selected =
+                                  pendingAnchor?.screenId === screen.id &&
+                                  pendingAnchor.side === side &&
+                                  Math.abs(pendingAnchor.start - segment.start) < 1e-6;
+                                const size = `${(segment.end - segment.start) * 100}%`;
+                                const offset = `${segment.start * 100}%`;
+
+                                return (
+                                  <button
+                                    key={`${segment.start}-${segment.end}`}
+                                    type="button"
+                                    className={`edge-segment ${segment.link ? "linked" : ""} ${
+                                      selected ? "selected" : ""
+                                    } ${blocker ? "blocked" : ""}`}
+                                    style={
+                                      sideRunsHorizontally(side)
+                                        ? { left: offset, width: size }
+                                        : { top: offset, height: size }
+                                    }
+                                    title={
+                                      blocker
+                                        ? `${ui.layout.edgesBlockedByCompositor} (${blocker.name})`
+                                        : segment.link
+                                          ? ui.layout.edgesUnlink
+                                          : ui.layout.edgesHint
+                                    }
+                                    onClick={() =>
+                                      handleSegmentClick(screen, side, segment)
+                                    }
+                                    onDoubleClick={(event) =>
+                                      handleSegmentSplit(event, screen, side)
+                                    }
+                                  />
+                                );
+                              })}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })
+                : null}
               <div className="board-zoom-controls">
                 <button
                   type="button"
@@ -2263,6 +2468,51 @@ function App() {
                 </button>
               </div>
             </div>
+
+            {boardMode === "edges" ? (
+              <div className="edge-editor-bar">
+                <p className="edge-editor-hint">
+                  {edgeNotice ??
+                    (edgeLinks.length === 0
+                      ? ui.layout.edgesEmpty
+                      : pendingAnchor
+                        ? `${ui.layout.edgesPending} ${
+                            screens.find((item) => item.id === pendingAnchor.screenId)
+                              ?.name ?? pendingAnchor.screenId
+                          } · ${ui.sides[pendingAnchor.side]}`
+                        : ui.layout.edgesHint)}
+                </p>
+                <div className="edge-editor-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      setEdgeCuts({});
+                      setPendingAnchor(null);
+                      setEdgeNotice(null);
+                      updateLayout((current) => ({
+                        ...current,
+                        edgeLinks: edgeLinksFromGeometry(current),
+                      }));
+                    }}
+                  >
+                    {ui.layout.edgesReset}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      setEdgeCuts({});
+                      setPendingAnchor(null);
+                      setEdgeNotice(null);
+                      updateLayout((current) => ({ ...current, edgeLinks: [] }));
+                    }}
+                  >
+                    {ui.layout.edgesClear}
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </section>
         </section>
       ) : null}

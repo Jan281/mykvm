@@ -2171,3 +2171,166 @@
     display: grid;
   }
 }
+
+/* ---- Edge link editor ---------------------------------------------------- */
+
+.board-mode-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: rgba(63, 63, 70, 0.5);
+}
+
+.board-mode-switch button {
+  border: 0;
+  cursor: pointer;
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: transparent;
+  color: rgba(228, 228, 231, 0.72);
+}
+
+.board-mode-switch button.active {
+  background: rgba(24, 24, 27, 0.92);
+  color: #fafafa;
+}
+
+/* Sits over the screen rectangle, but only the strips take the pointer, so the
+   rectangle underneath stays draggable in screen mode. */
+.screen-edges {
+  position: absolute;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.edge-strip {
+  position: absolute;
+  pointer-events: none;
+}
+
+.edge-strip.top,
+.edge-strip.bottom {
+  left: 0;
+  right: 0;
+  height: 12px;
+}
+
+.edge-strip.top {
+  top: -6px;
+}
+.edge-strip.bottom {
+  bottom: -6px;
+}
+
+.edge-strip.left,
+.edge-strip.right {
+  top: 0;
+  bottom: 0;
+  width: 12px;
+}
+
+.edge-strip.left {
+  left: -6px;
+}
+.edge-strip.right {
+  right: -6px;
+}
+
+.edge-segment {
+  position: absolute;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  pointer-events: auto;
+  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.45);
+  transition: background 120ms ease;
+}
+
+.edge-strip.top .edge-segment,
+.edge-strip.bottom .edge-segment {
+  top: 4px;
+  height: 4px;
+}
+
+.edge-strip.left .edge-segment,
+.edge-strip.right .edge-segment {
+  left: 4px;
+  width: 4px;
+}
+
+.edge-segment:hover {
+  background: rgba(203, 213, 225, 0.85);
+}
+
+.edge-segment.linked {
+  background: #2dd4bf;
+}
+
+.edge-segment.selected {
+  background: #facc15;
+  box-shadow: 0 0 0 2px rgba(250, 204, 21, 0.35);
+}
+
+/* An edge the compositor refuses to guard. Striped rather than merely dim: it
+   is not disabled, it is unusable, and the difference matters. */
+.edge-segment.blocked {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(248, 113, 113, 0.75) 0,
+    rgba(248, 113, 113, 0.75) 3px,
+    transparent 3px,
+    transparent 6px
+  );
+}
+
+.edge-editor-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.edge-editor-hint {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(212, 212, 216, 0.78);
+}
+
+.edge-editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.theme-light .board-mode-switch {
+  background: rgba(203, 213, 225, 0.5);
+}
+
+.theme-light .board-mode-switch button {
+  color: #475569;
+}
+
+.theme-light .board-mode-switch button.active {
+  background: #ffffff;
+  color: #0f172a;
+}
+
+.theme-light .edge-segment {
+  background: rgba(100, 116, 139, 0.45);
+}
+
+.theme-light .edge-segment:hover {
+  background: rgba(71, 85, 105, 0.75);
+}
+
+.theme-light .edge-segment.linked {
+  background: #0d9488;
+}
+
+.theme-light .edge-editor-hint {
+  color: #475569;
+}
