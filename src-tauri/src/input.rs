@@ -2332,14 +2332,11 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         } else if link.b.device_id == local_device.id {
             (&link.b, &link.a)
         } else {
-            // Not a fault: this is a hop between peers, followed once the
-            // cursor is already out there. It just cannot carry a barrier.
-            log::debug!(
-                "[wayland] link {} joins two remote screens ({} and {}); no barrier, used for hops only",
-                link.id,
-                link.a.screen_id,
-                link.b.screen_id,
-            );
+            // A hop between peers, followed once the cursor is already out
+            // there. It carries no barrier, which is not worth a word: this
+            // runs from the once-a-second wiring check, and saying so there
+            // rotated the log fast enough to discard the crossings being
+            // diagnosed.
             continue;
         };
         if remote_anchor.device_id == local_device.id {
