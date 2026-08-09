@@ -4232,9 +4232,13 @@ function createScreensFromPeer(
 }
 
 function formatScreenCount(count: number, language: AppLanguage) {
-  return language === "en"
-    ? `${count} ${count === 1 ? "screen" : "screens"}`
-    : `${count} 屏`;
+  if (language === "cn") {
+    return `${count} 屏`;
+  }
+  if (language === "de") {
+    return `${count} ${count === 1 ? "Bildschirm" : "Bildschirme"}`;
+  }
+  return `${count} ${count === 1 ? "screen" : "screens"}`;
 }
 
 function fileTransferTargetIdAtPosition(
@@ -4275,13 +4279,17 @@ function formatFileTransferSummary(
   language: AppLanguage,
 ) {
   const size = formatFileTransferBytes(summary.byteCount);
-  if (language === "en") {
-    return `${TEXT.en.devices.fileTransferSent} ${summary.fileCount} ${
-      summary.fileCount === 1 ? "file" : "files"
-    } to ${summary.targetName} · ${size}`;
+  if (language === "cn") {
+    return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
   }
-
-  return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
+  if (language === "de") {
+    return `${summary.fileCount} ${
+      summary.fileCount === 1 ? "Datei" : "Dateien"
+    } an ${summary.targetName} ${TEXT.de.devices.fileTransferSent} · ${size}`;
+  }
+  return `${TEXT.en.devices.fileTransferSent} ${summary.fileCount} ${
+    summary.fileCount === 1 ? "file" : "files"
+  } to ${summary.targetName} · ${size}`;
 }
 
 function formatFileTransferBytes(bytes: number) {

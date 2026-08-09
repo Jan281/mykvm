@@ -866,7 +866,7 @@ pub fn input_runtime_status(
         NativeStageStatus {
             state: "ready".into(),
             detail: format!(
-                "控制端已就绪，{} 条远端贴边可用于鼠标和键盘切换。",
+                "Ready. {} remote screen edge(s) available for mouse and keyboard switching.",
                 targets.len()
             ),
         }
@@ -884,7 +884,7 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
     if !macos_accessibility_trusted(request_permission) {
         return NativeStageStatus {
             state: "error".into(),
-            detail: "macOS 需要给 MyKVM 辅助功能权限才能注入远端点击和键盘。请到 系统设置 > 隐私与安全性 > 辅助功能 启用 MyKVM，然后完全退出并重新打开应用。".into(),
+            detail: "macOS needs Accessibility permission for MyKVM to inject remote clicks and keys. Enable MyKVM under System Settings > Privacy & Security > Accessibility, then quit and reopen the app.".into(),
         };
     }
 
@@ -896,7 +896,7 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
     if macos_secure_input_enabled() {
         return NativeStageStatus {
             state: "error".into(),
-            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会拦截所有注入的键盘事件（鼠标点击不受影响）。请退出正在占用安全输入的应用——常见来源：终端里勾选的“安全键盘输入”、聚焦中的密码输入框、部分密码管理器；必要时注销重新登录，然后重试。".into(),
+            detail: "macOS Secure Keyboard Entry is on, so the system blocks every injected key event (mouse clicks still work). Quit whatever is holding secure input — usually Terminal with \"Secure Keyboard Entry\" ticked, a focused password field, or a password manager — then try again. A logout and login clears it if nothing else does.".into(),
         };
     }
 
@@ -1067,7 +1067,7 @@ fn start_platform_capture(
             Ok(tap) => tap,
             Err(_) => {
                 let _ = ready_tx.send(Err(
-                    "macOS 生产包需要单独授权辅助功能和输入监控。请到 系统设置 > 隐私与安全性 > 辅助功能 / 输入监控 启用 MyKVM，然后完全退出并重新打开应用。".into(),
+                    "A packaged macOS build needs Accessibility and Input Monitoring granted separately. Enable MyKVM under System Settings > Privacy & Security > Accessibility / Input Monitoring, then quit and reopen the app.".into(),
                 ));
                 return;
             }
@@ -1167,7 +1167,7 @@ fn start_platform_capture(
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(())) => NativeStageStatus {
             state: "ready".into(),
-            detail: format!("控制端已就绪，{target_count} 条远端贴边可用于鼠标和键盘切换。"),
+            detail: format!("Ready. {target_count} remote screen edge(s) available for mouse and keyboard switching."),
         },
         Ok(Err(error)) => NativeStageStatus {
             state: "error".into(),
@@ -1302,7 +1302,7 @@ fn start_platform_capture(
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(())) => NativeStageStatus {
             state: "ready".into(),
-            detail: format!("控制端已就绪，{target_count} 条远端贴边可用于鼠标和键盘切换。"),
+            detail: format!("Ready. {target_count} remote screen edge(s) available for mouse and keyboard switching."),
         },
         Ok(Err(error)) => NativeStageStatus {
             state: "error".into(),
@@ -2279,11 +2279,11 @@ fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
         .filter(|device| device.role != "local" && device.online)
         .count();
     let detail = if remote_count == 0 {
-        "控制模式已开启，但布局里还没有远端设备。先让对方电脑运行 mykvm，再在 LAN devices 里 Scan 并 Add。"
+        "Control mode is on, but the layout has no remote device yet. Run MyKVM on the other machine, then Scan and Add it under LAN devices."
     } else if online_remote_count == 0 {
-        "控制模式已开启，但远端设备都被标记为离线。把要控制的设备切回 online 后再启动运行时。"
+        "Control mode is on, but every remote device is marked offline. Bring the device you want to control back online, then start again."
     } else {
-        "控制模式已开启，且已有在线远端设备，但屏幕还没有和本机贴边。拖动远端显示器贴住本机边缘后才会生成切屏目标。"
+        "Control mode is on and a remote device is online, but no screen shares an edge with this machine. Link a remote screen to one of your own edges to create a crossing."
     };
 
     NativeStageStatus {
@@ -2295,7 +2295,7 @@ fn no_target_status(layout: &LayoutState) -> NativeStageStatus {
 fn receive_only_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "idle".into(),
-        detail: "当前是仅接收模式：会接收远端输入，但不会捕获本机鼠标和键盘。".into(),
+        detail: "Receive-only mode: remote input is accepted, but this machine's mouse and keyboard are not captured.".into(),
     }
 }
 

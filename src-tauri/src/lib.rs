@@ -693,7 +693,7 @@ impl AppRuntime {
                 requester_name: String::new(),
                 requester_ip: String::new(),
                 expires_at_ms: 0,
-                detail: "客户端已配对，只对白名单服务端响应。".into(),
+                detail: "Paired. This client only accepts input from allow-listed servers.".into(),
             };
         }
 
@@ -714,7 +714,7 @@ impl AppRuntime {
                     requester_name: challenge.requester_name.clone(),
                     requester_ip: challenge.requester_ip.clone(),
                     expires_at_ms: challenge.expires_at_ms,
-                    detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
+                    detail: "A server is requesting pairing. Enter this code on the server.".into(),
                 };
             }
         }
@@ -725,7 +725,7 @@ impl AppRuntime {
             requester_name: String::new(),
             requester_ip: String::new(),
             expires_at_ms: 0,
-            detail: "客户端等待服务端发起配对。".into(),
+            detail: "Waiting for a server to start pairing.".into(),
         }
     }
 
@@ -1210,7 +1210,7 @@ impl AppRuntime {
         } else {
             NativeStageStatus {
                 state: "idle".into(),
-                detail: "剪贴板同步已开启，仅在鼠标切到远端设备后惰性发送文本/图片剪贴板。".into(),
+                detail: "Clipboard sync is on. Text and images are sent lazily, once the cursor moves to a remote device.".into(),
             }
         }
     }
@@ -1793,17 +1793,17 @@ fn update_runtime_tray_state(app: &AppHandle, started: bool) {
 
 fn runtime_toggle_menu_label(started: bool) -> &'static str {
     if started {
-        "快捷启停：已启动"
+        "Stop sharing"
     } else {
-        "快捷启停：已停止"
+        "Start sharing"
     }
 }
 
 fn runtime_tray_tooltip(started: bool) -> &'static str {
     if started {
-        "mykvm · 已启动"
+        "MyKVM · sharing"
     } else {
-        "mykvm · 已停止"
+        "MyKVM · stopped"
     }
 }
 
@@ -2003,19 +2003,19 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
             "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => meta = true,
             raw_key => {
                 if key.is_some() {
-                    return Err("快捷启停快捷键只能包含一个主按键。".into());
+                    return Err("The start/stop shortcut may contain only one main key.".into());
                 }
                 key = Some(
                     canonical_runtime_toggle_key(raw_key)
-                        .ok_or_else(|| format!("无法识别快捷启停快捷键按键：{raw_key}"))?,
+                        .ok_or_else(|| format!("Unrecognised key in the start/stop shortcut: {raw_key}"))?,
                 );
             }
         }
     }
 
-    let key = key.ok_or_else(|| "快捷启停快捷键缺少主按键。".to_string())?;
+    let key = key.ok_or_else(|| "The start/stop shortcut is missing its main key.".to_string())?;
     if !(ctrl || alt || shift || meta) && !allows_single_runtime_toggle_key(&key) {
-        return Err("快捷启停快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。".into());
+        return Err("The start/stop shortcut needs a modifier, or one of F1-F24 / ScrollLock.".into());
     }
 
     let mut parts = Vec::new();
@@ -2035,7 +2035,7 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
     let shortcut = parts.join("+");
     shortcut
         .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .map_err(|error| format!("无法注册快捷启停快捷键 {normalized}: {error}"))?;
+        .map_err(|error| format!("Could not register the start/stop shortcut {normalized}: {error}"))?;
 
     Ok(Some(shortcut))
 }
@@ -2207,13 +2207,13 @@ fn send_files_to_device(
     let state = state.inner();
     let device_id = device_id.as_str();
     if paths.is_empty() {
-        return Err("请选择要传输的文件。".into());
+        return Err("Select the files to transfer.".into());
     }
 
     state.start_discovery()?;
     let layout = state.layout_snapshot();
     if !layout.file_transfer_enabled {
-        return Err("文件传输未开启。".into());
+        return Err("File transfer is switched off.".into());
     }
     let mut local_peer = local_peer_from_layout(&layout);
     let quic_transport = state
@@ -2398,7 +2398,7 @@ fn request_lan_pairing(
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
     if layout.machine_role != "server" {
-        return Err("只有服务端可以发起配对。".into());
+        return Err("Only a server can start pairing.".into());
     }
 
     let mut local_peer = local_peer_from_layout(&layout);
@@ -2429,13 +2429,13 @@ fn confirm_lan_pairing(
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
     if layout.machine_role != "server" {
-        return Err("只有服务端可以确认配对。".into());
+        return Err("Only a server can confirm pairing.".into());
     }
 
     let mut local_peer = local_peer_from_layout(&layout);
     let transport = state
         .quic_transport_handle()
-        .ok_or_else(|| "QUIC 传输未启动，无法安全确认配对。".to_string())?;
+        .ok_or_else(|| "QUIC transport is not running, so pairing cannot be confirmed securely.".to_string())?;
     apply_transport_to_peer(&mut local_peer, &transport);
     let peer = match confirm_pairing_for_peer(
         &local_peer,
@@ -3372,7 +3372,7 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
         clipboard: if layout.clipboard_sync {
             NativeStageStatus {
                 state: "idle".into(),
-                detail: "剪贴板同步已开启，启动共享服务后会开始同步。".into(),
+                detail: "Clipboard sync is on. It starts once sharing is running.".into(),
             }
         } else {
             clipboard_disabled_status()
@@ -4612,14 +4612,14 @@ fn bind_reusable_udp_port(port: u16) -> std::io::Result<UdpSocket> {
 fn clipboard_disabled_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "idle".into(),
-        detail: "剪贴板同步已关闭。".into(),
+        detail: "Clipboard sync is off.".into(),
     }
 }
 
 fn clipboard_ready_status() -> NativeStageStatus {
     NativeStageStatus {
         state: "ready".into(),
-        detail: "剪贴板同步已开启，仅在鼠标切到远端设备后复用当前传输端口发送。".into(),
+        detail: "Clipboard sync is on. Content is sent over the existing transport port, once the cursor moves to a remote device.".into(),
     }
 }
 
@@ -5103,7 +5103,7 @@ fn file_transfer_target_for_device(
     device_id: &str,
 ) -> Result<FileTransferTarget, String> {
     if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
-        return Err("当前设备尚未完成配对，无法传输文件。".into());
+        return Err("This device is not paired yet, so files cannot be transferred.".into());
     }
 
     if let Some(device) = layout
@@ -5112,16 +5112,16 @@ fn file_transfer_target_for_device(
         .find(|device| device.id == device_id && device.role != "local")
     {
         if !device.online || !device.input_ready {
-            return Err(format!("{} 当前不在线，无法传输文件。", device.name));
+            return Err(format!("{} is offline, so files cannot be transferred.", device.name));
         }
         if device.protocol_version != quic_transport::PROTOCOL_VERSION
             || device.transport_public_key.trim().is_empty()
         {
-            return Err(format!("{} 版本过旧，请先升级 MyKVM。", device.name));
+            return Err(format!("{} is running an older version. Update MyKVM there first.", device.name));
         }
         let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
         let host = file_transfer_host(&device.host)
-            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
+            .ok_or_else(|| format!("{} has no usable address.", device.name))?;
 
         return Ok(FileTransferTarget {
             device_id: device.id.clone(),
@@ -5147,12 +5147,12 @@ fn file_transfer_target_for_device(
                         || (!controller.transport_public_key.trim().is_empty()
                             && peer.transport_public_key == controller.transport_public_key)
                 })
-                .ok_or_else(|| format!("{} 当前不在线，无法传输文件。", controller.name))?;
+                .ok_or_else(|| format!("{} is offline, so files cannot be transferred.", controller.name))?;
             if peer.protocol_version != quic_transport::PROTOCOL_VERSION
                 || peer.transport_public_key.trim().is_empty()
                 || peer.quic_port == 0
             {
-                return Err(format!("{} 版本过旧，请先升级 MyKVM。", controller.name));
+                return Err(format!("{} is running an older version. Update MyKVM there first.", controller.name));
             }
             let host = if !peer.ip.trim().is_empty() {
                 peer.ip.clone()
@@ -5160,7 +5160,7 @@ fn file_transfer_target_for_device(
                 file_transfer_host(&peer.host)
                     .or_else(|| file_transfer_host(&controller.ip))
                     .or_else(|| file_transfer_host(&controller.host))
-                    .ok_or_else(|| format!("{} 缺少可用地址。", controller.name))?
+                    .ok_or_else(|| format!("{} has no usable address.", controller.name))?
             };
 
             return Ok(FileTransferTarget {
@@ -5175,7 +5175,7 @@ fn file_transfer_target_for_device(
         }
     }
 
-    Err("没有找到可传输的目标设备。".into())
+    Err("No device available to transfer to.".into())
 }
 
 fn file_transfer_host(host_value: &str) -> Option<String> {
@@ -5196,13 +5196,13 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
         }
         let path = PathBuf::from(path_value);
         let metadata = fs::metadata(&path)
-            .map_err(|error| format!("无法读取文件 {}: {error}", path.display()))?;
+            .map_err(|error| format!("Cannot read file {}: {error}", path.display()))?;
         if !metadata.is_file() {
-            return Err(format!("暂不支持传输文件夹或特殊文件：{}", path.display()));
+            return Err(format!("Folders and special files cannot be transferred: {}", path.display()));
         }
         if metadata.len() > FILE_TRANSFER_MAX_FILE_BYTES {
             return Err(format!(
-                "{} 超过单文件上限 {}。",
+                "{} exceeds the per-file limit of {}。",
                 path.display(),
                 format_bytes(FILE_TRANSFER_MAX_FILE_BYTES)
             ));
@@ -5216,7 +5216,7 @@ fn collect_transfer_files(paths: &[String]) -> Result<Vec<TransferFile>, String>
     }
 
     if files.is_empty() {
-        Err("请选择要传输的文件。".into())
+        Err("Select the files to transfer.".into())
     } else {
         Ok(files)
     }
@@ -5229,7 +5229,7 @@ fn transfer_file_name(path: &Path) -> Result<String, String> {
         .unwrap_or_default();
     sanitize_transfer_file_name(&raw_name).ok_or_else(|| {
         format!(
-            "文件名不可用于传输：{}",
+            "This file name cannot be transferred: {}",
             if raw_name.is_empty() {
                 path.display().to_string()
             } else {
@@ -5266,14 +5266,14 @@ fn send_transfer_file(
     packet_count += 1;
 
     let mut file_handle = fs::File::open(&file.path)
-        .map_err(|error| format!("无法打开文件 {}: {error}", file.path.display()))?;
+        .map_err(|error| format!("Cannot open file {}: {error}", file.path.display()))?;
     let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
     let mut offset = 0_u64;
     let mut chunk_index = 0_u64;
     loop {
         let read = file_handle
             .read(&mut buffer)
-            .map_err(|error| format!("读取文件 {} 失败: {error}", file.path.display()))?;
+            .map_err(|error| format!("Reading file {} failed: {error}", file.path.display()))?;
         if read == 0 {
             break;
         }
@@ -5359,7 +5359,7 @@ fn send_file_transfer_packet(
     );
     quic_transport
         .send_stream_expect_ack(peer, payload)
-        .map_err(|error| format!("文件传输失败: {error}"))
+        .map_err(|error| format!("File transfer failed: {error}"))
 }
 
 fn handle_file_transfer_packet(
@@ -6375,7 +6375,7 @@ fn confirm_pairing_for_peer(
         || challenge_peer.protocol_version != quic_transport::PROTOCOL_VERSION
         || challenge_peer.quic_port == 0
     {
-        return Err("客户端暂不支持安全配对确认，请升级客户端后重试。".into());
+        return Err("This client does not support secure pairing confirmation. Update it and try again.".into());
     }
 
     let fields = DiscoveryPairingFields {
@@ -6397,7 +6397,7 @@ fn confirm_pairing_for_peer(
 
     let paired_peer = probe_for_peer(local_peer, host, base_port)?;
     if paired_peer.pairing_required {
-        return Err("配对未被客户端接受，请检查验证码后重试。".into());
+        return Err("The client rejected the pairing. Check the code and try again.".into());
     }
 
     Ok(paired_peer)
@@ -6782,7 +6782,7 @@ fn complete_pairing_from_confirm(
     let cluster_id = cluster_id.unwrap_or_default();
     let pair_secret = pair_secret.unwrap_or_default();
     if code.trim().is_empty() || cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
-        return Err("配对请求缺少验证码或组信息。".into());
+        return Err("The pairing request is missing its code or cluster information.".into());
     }
 
     {
@@ -6790,24 +6790,24 @@ fn complete_pairing_from_confirm(
             .lock()
             .map_err(|_| "pairing challenge lock poisoned".to_string())?;
         let Some(existing) = challenge.as_mut() else {
-            return Err("验证码已过期，请重新发起配对。".into());
+            return Err("The code has expired. Start pairing again.".into());
         };
         if existing.expires_at <= Instant::now() {
             *challenge = None;
-            return Err("验证码已过期，请重新发起配对。".into());
+            return Err("The code has expired. Start pairing again.".into());
         }
         if existing.requester_id != requester.id
             || (!existing.requester_public_key.trim().is_empty()
                 && existing.requester_public_key != requester.transport_public_key)
         {
-            return Err("配对请求来源不一致，请重新发起配对。".into());
+            return Err("The pairing request came from a different address. Start pairing again.".into());
         }
         if existing.code != code.trim() {
             existing.attempts = existing.attempts.saturating_add(1);
             if existing.attempts >= PAIRING_MAX_ATTEMPTS {
                 *challenge = None;
             }
-            return Err("验证码不正确。".into());
+            return Err("Wrong code.".into());
         }
         *challenge = None;
     }
@@ -6817,7 +6817,7 @@ fn complete_pairing_from_confirm(
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
         if layout.machine_role != "client" {
-            return Err("只有客户端可以接受服务端配对。".into());
+            return Err("Only a client can accept pairing from a server.".into());
         }
 
         layout.cluster_id = cluster_id.trim().into();

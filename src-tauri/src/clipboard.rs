@@ -100,10 +100,19 @@ where
 }
 
 fn read_text_content() -> Option<ClipboardContent> {
-    read_text()
-        .ok()
-        .filter(|text| !text.is_empty())
-        .map(ClipboardContent::Text)
+    match read_text() {
+        Ok(text) => (!text.is_empty()).then(|| ClipboardContent::Text(text)),
+        Err(error) => {
+            // Once, not per poll: this runs on a timer, and a clipboard that
+            // cannot be read at all stays unreadable. Silence here is what made
+            // a missing backend look like "sync is on but does nothing".
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                log::warn!("[clipboard] cannot read the system clipboard: {error}");
+            });
+            None
+        }
+    }
 }
 
 fn read_image_content() -> Option<ClipboardContent> {
@@ -343,7 +352,10 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
     })
 }
 
-#[cfg(target_os = "windows")]
+/// Linux and Windows both go through arboard; on Linux that means the Wayland
+/// data-control protocol (or X11) spoken in-process. Shelling out to wl-paste
+/// was the old path and needed a tool no distribution installs by default.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn read_system_text() -> Result<String, String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
@@ -352,21 +364,11 @@ fn read_system_text() -> Result<String, String> {
         .map_err(|error| format!("failed to read clipboard text: {error}"))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn read_system_text() -> Result<String, String> {
-    use std::process::Command;
-
-    let output = if cfg!(target_os = "macos") {
-        utf8_command("pbpaste").output()
-    } else {
-        Command::new("sh")
-            .args([
-                "-c",
-                "wl-paste -n 2>/dev/null || xclip -selection clipboard -out",
-            ])
-            .output()
-    }
-    .map_err(|error| format!("failed to read clipboard: {error}"))?;
+    let output = utf8_command("pbpaste")
+        .output()
+        .map_err(|error| format!("failed to read clipboard: {error}"))?;
 
     if output.status.success() {
         String::from_utf8(output.stdout)
@@ -379,7 +381,7 @@ fn read_system_text() -> Result<String, String> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn write_system_text(text: &str) -> Result<(), String> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
@@ -388,19 +390,14 @@ fn write_system_text(text: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to write clipboard text: {error}"))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn write_system_text(text: &str) -> Result<(), String> {
-    use std::{io::Write, process::Command, process::Stdio};
+    use std::{io::Write, process::Stdio};
 
-    let mut child = if cfg!(target_os = "macos") {
-        utf8_command("pbcopy").stdin(Stdio::piped()).spawn()
-    } else {
-        Command::new("sh")
-            .args(["-c", "wl-copy 2>/dev/null || xclip -selection clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-    }
-    .map_err(|error| format!("failed to write clipboard: {error}"))?;
+    let mut child = utf8_command("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to write clipboard: {error}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin

@@ -37,7 +37,11 @@ tauri-plugin-log = "2"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-autostart = "2"
-arboard = "3.6.1"
+# wayland-data-control talks the Wayland clipboard protocol directly through
+# wl-clipboard-rs. Without it the Linux path had to shell out to wl-paste and
+# wl-copy, which are not installed by default anywhere — and every read and
+# write failed silently on a machine that lacked them.
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 ring = "0.17.14"
 quinn = "0.11"
 rcgen = "0.13"
