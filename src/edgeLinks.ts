@@ -273,6 +273,68 @@ export function connect(links: EdgeLink[], a: EdgeAnchor, b: EdgeAnchor): EdgeLi
   return [...kept, { id: makeLinkId(), a, b }]
 }
 
+/** How many pixels long one side of a screen is. */
+export function sideLength(screen: Screen, side: EdgeSide) {
+  return Math.max(sideRunsHorizontally(side) ? screen.width : screen.height, 1)
+}
+
+export function fractionToPixels(fraction: number, screen: Screen, side: EdgeSide) {
+  return Math.round(clamp01(fraction) * sideLength(screen, side))
+}
+
+export function pixelsToFraction(pixels: number, screen: Screen, side: EdgeSide) {
+  return clamp01(pixels / sideLength(screen, side))
+}
+
+const BOUNDARY_EPSILON = 1e-6
+
+/**
+ * Moves one boundary on a screen side, in every link that shares it.
+ *
+ * Two neighbouring stretches meet at a single boundary, so nudging it has to
+ * move both — otherwise they would silently overlap or leave a gap that routes
+ * nowhere.
+ */
+export function moveBoundary(
+  links: EdgeLink[],
+  screenId: string,
+  side: EdgeSide,
+  from: number,
+  to: number,
+): EdgeLink[] {
+  const shift = (value: number) => (Math.abs(value - from) < BOUNDARY_EPSILON ? to : value)
+
+  return links.map((link) => {
+    const move = (anchor: EdgeAnchor): EdgeAnchor =>
+      anchorMatchesScreen(anchor, screenId, side)
+        ? { ...anchor, start: shift(anchor.start), end: shift(anchor.end) }
+        : anchor
+    return { ...link, a: move(link.a), b: move(link.b) }
+  })
+}
+
+/** Sets one anchor's stretch outright, used by the pixel fields. */
+export function setAnchorSpan(
+  links: EdgeLink[],
+  linkId: string,
+  which: 'a' | 'b',
+  start: number,
+  end: number,
+): EdgeLink[] {
+  return links.map((link) =>
+    link.id === linkId
+      ? {
+          ...link,
+          [which]: {
+            ...link[which],
+            start: clamp01(Math.min(start, end)),
+            end: clamp01(Math.max(start, end)),
+          },
+        }
+      : link,
+  )
+}
+
 export function describeAnchor(anchor: EdgeAnchor, screenName: string, sideLabel: string) {
   const whole = anchor.start <= 1e-6 && anchor.end >= 1 - 1e-6
   if (whole) return `${screenName} · ${sideLabel}`

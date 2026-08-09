@@ -52,6 +52,11 @@ import {
   clamp01,
   connect,
   edgeBlockedBy,
+  fractionToPixels,
+  moveBoundary,
+  pixelsToFraction,
+  sideLength,
+  setAnchorSpan,
   edgeLinksFromGeometry,
   effectiveEdgeLinks,
   removeLink,
@@ -1290,6 +1295,79 @@ function App() {
     }));
   }
 
+  // Right-clicking a stretch opens this. Held by identity (screen, side, where
+  // it starts) rather than by value, so the panel keeps pointing at the same
+  // stretch while its bounds are being edited.
+  const [edgeDetail, setEdgeDetail] = useState<{
+    screenId: string;
+    side: EdgeSide;
+    start: number;
+    end: number;
+    left: number;
+    top: number;
+  } | null>(null);
+
+  const detailScreen = useMemo(
+    () => screens.find((item) => item.id === edgeDetail?.screenId) ?? null,
+    [screens, edgeDetail],
+  );
+  const detailSegment = useMemo(() => {
+    if (!edgeDetail || !detailScreen) return null;
+    return (
+      sideSegments(
+        edgeLinks,
+        edgeDetail.screenId,
+        edgeDetail.side,
+        cutsFor(edgeDetail.screenId, edgeDetail.side),
+      ).find((segment) => Math.abs(segment.start - edgeDetail.start) < 1e-6) ?? null
+    );
+  }, [edgeDetail, detailScreen, edgeLinks, edgeCuts]);
+
+  /** The far end of the link under the detail panel, if it is linked. */
+  const detailRemote = useMemo(() => {
+    const link = detailSegment?.link;
+    if (!link || !edgeDetail) return null;
+    const which: "a" | "b" =
+      link.a.screenId === edgeDetail.screenId && link.a.side === edgeDetail.side ? "b" : "a";
+    const anchor = link[which];
+    const screen = screens.find((item) => item.id === anchor.screenId);
+    return screen ? { link, which, anchor, screen } : null;
+  }, [detailSegment, edgeDetail, screens]);
+
+  /** Moves a boundary of the stretch under the panel, in pixels. */
+  function commitDetailBound(which: "start" | "end", pixels: number) {
+    if (!edgeDetail || !detailScreen) return;
+    const next = pixelsToFraction(pixels, detailScreen, edgeDetail.side);
+    const from = which === "start" ? edgeDetail.start : edgeDetail.end;
+    if (Math.abs(next - from) < 1e-6) return;
+
+    // A boundary is shared with the neighbouring stretch, so both move.
+    updateEdgeLinks((links) =>
+      moveBoundary(links, edgeDetail.screenId, edgeDetail.side, from, next),
+    );
+    const key = `${edgeDetail.screenId}:${edgeDetail.side}`;
+    setEdgeCuts((current) => ({
+      ...current,
+      [key]: (current[key] ?? []).map((cut) => (Math.abs(cut - from) < 1e-6 ? next : cut)),
+    }));
+    setEdgeDetail({ ...edgeDetail, [which]: next });
+  }
+
+  function commitDetailRemoteBound(which: "start" | "end", pixels: number) {
+    if (!detailRemote) return;
+    const { link, which: side, anchor, screen } = detailRemote;
+    const next = pixelsToFraction(pixels, screen, anchor.side);
+    updateEdgeLinks((links) =>
+      setAnchorSpan(
+        links,
+        link.id,
+        side,
+        which === "start" ? next : anchor.start,
+        which === "end" ? next : anchor.end,
+      ),
+    );
+  }
+
   function handleSegmentClick(
     screen: FlattenedScreen,
     side: EdgeSide,
@@ -2453,6 +2531,19 @@ function App() {
                                     onDoubleClick={(event) =>
                                       handleSegmentSplit(event, screen, side)
                                     }
+                                    onContextMenu={(event) => {
+                                      event.preventDefault();
+                                      const board =
+                                        boardRef.current?.getBoundingClientRect();
+                                      setEdgeDetail({
+                                        screenId: screen.id,
+                                        side,
+                                        start: segment.start,
+                                        end: segment.end,
+                                        left: event.clientX - (board?.left ?? 0),
+                                        top: event.clientY - (board?.top ?? 0),
+                                      });
+                                    }}
                                   />
                                 );
                               })}
@@ -2463,6 +2554,124 @@ function App() {
                     );
                   })
                 : null}
+              {boardMode === "edges" && edgeDetail && detailScreen && detailSegment ? (
+                <div
+                  className="edge-detail"
+                  style={{ left: edgeDetail.left, top: edgeDetail.top }}
+                >
+                  <header>
+                    <strong>{ui.layout.detailTitle}</strong>
+                    <button type="button" onClick={() => setEdgeDetail(null)}>
+                      ×
+                    </button>
+                  </header>
+
+                  <p className="edge-detail-scope">
+                    {ui.layout.detailLocal} · {detailScreen.name} ·{" "}
+                    {ui.sides[edgeDetail.side]}
+                  </p>
+                  <div className="edge-detail-fields">
+                    <label>
+                      {ui.layout.detailStart}
+                      <input
+                        type="number"
+                        min={0}
+                        max={sideLength(detailScreen, edgeDetail.side)}
+                        defaultValue={fractionToPixels(
+                          detailSegment.start,
+                          detailScreen,
+                          edgeDetail.side,
+                        )}
+                        key={`start-${detailSegment.start}`}
+                        onBlur={(event) =>
+                          commitDetailBound("start", Number(event.target.value))
+                        }
+                      />
+                      <span>{ui.layout.detailPixels}</span>
+                    </label>
+                    <label>
+                      {ui.layout.detailEnd}
+                      <input
+                        type="number"
+                        min={0}
+                        max={sideLength(detailScreen, edgeDetail.side)}
+                        defaultValue={fractionToPixels(
+                          detailSegment.end,
+                          detailScreen,
+                          edgeDetail.side,
+                        )}
+                        key={`end-${detailSegment.end}`}
+                        onBlur={(event) =>
+                          commitDetailBound("end", Number(event.target.value))
+                        }
+                      />
+                      <span>{ui.layout.detailPixels}</span>
+                    </label>
+                  </div>
+
+                  {detailRemote ? (
+                    <>
+                      <p className="edge-detail-scope">
+                        {ui.layout.detailRemote} · {detailRemote.screen.name} ·{" "}
+                        {ui.sides[detailRemote.anchor.side]}
+                      </p>
+                      <div className="edge-detail-fields">
+                        <label>
+                          {ui.layout.detailStart}
+                          <input
+                            type="number"
+                            min={0}
+                            max={sideLength(detailRemote.screen, detailRemote.anchor.side)}
+                            defaultValue={fractionToPixels(
+                              detailRemote.anchor.start,
+                              detailRemote.screen,
+                              detailRemote.anchor.side,
+                            )}
+                            key={`remote-start-${detailRemote.anchor.start}`}
+                            onBlur={(event) =>
+                              commitDetailRemoteBound("start", Number(event.target.value))
+                            }
+                          />
+                          <span>{ui.layout.detailPixels}</span>
+                        </label>
+                        <label>
+                          {ui.layout.detailEnd}
+                          <input
+                            type="number"
+                            min={0}
+                            max={sideLength(detailRemote.screen, detailRemote.anchor.side)}
+                            defaultValue={fractionToPixels(
+                              detailRemote.anchor.end,
+                              detailRemote.screen,
+                              detailRemote.anchor.side,
+                            )}
+                            key={`remote-end-${detailRemote.anchor.end}`}
+                            onBlur={(event) =>
+                              commitDetailRemoteBound("end", Number(event.target.value))
+                            }
+                          />
+                          <span>{ui.layout.detailPixels}</span>
+                        </label>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => {
+                          updateEdgeLinks((links) =>
+                            removeLink(links, detailRemote.link.id),
+                          );
+                          setEdgeDetail(null);
+                        }}
+                      >
+                        {ui.layout.edgesUnlink}
+                      </button>
+                    </>
+                  ) : (
+                    <p className="edge-detail-note">{ui.layout.detailUnlinked}</p>
+                  )}
+                </div>
+              ) : null}
+
               <div className="board-zoom-controls">
                 <button
                   type="button"
