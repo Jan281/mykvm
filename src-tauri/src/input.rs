@@ -2059,11 +2059,21 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         // A link is usable only if exactly one end is ours; two local screens
         // wired together is not something capture can act on, and neither is a
         // link between two remote devices.
+        // Capture arms a barrier on a *local* screen edge, so a link needs
+        // exactly one end here. A link drawn between two remote screens
+        // describes roaming between peers, which capture cannot perform — the
+        // cursor stays on the screen it entered.
         let (local_anchor, remote_anchor) = if link.a.device_id == local_device.id {
             (&link.a, &link.b)
         } else if link.b.device_id == local_device.id {
             (&link.b, &link.a)
         } else {
+            log::warn!(
+                "[wayland] link {} joins two remote screens ({} and {}); neither end is a local screen edge, so nothing can be armed for it",
+                link.id,
+                link.a.screen_id,
+                link.b.screen_id,
+            );
             continue;
         };
         if remote_anchor.device_id == local_device.id {

@@ -1410,6 +1410,16 @@ function App() {
       return;
     }
 
+    // Capture arms a barrier on a local screen edge, so a link with no local
+    // end can never fire. Refuse it here rather than storing one that looks
+    // wired and quietly does nothing.
+    const localDeviceId = layout?.devices.find((device) => device.role === "local")?.id;
+    if (pendingAnchor.deviceId !== localDeviceId && anchor.deviceId !== localDeviceId) {
+      setEdgeNotice(ui.layout.edgesBothRemote);
+      setPendingAnchor(anchor);
+      return;
+    }
+
     updateEdgeLinks((links) => connect(links, pendingAnchor, anchor));
     setPendingAnchor(null);
   }

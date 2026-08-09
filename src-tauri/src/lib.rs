@@ -2962,6 +2962,19 @@ pub fn run() {
                     // Ceiling only. The effective level is set from the saved
                     // setting right after, and whenever the user changes it.
                     .level(log::LevelFilter::Trace)
+                    // Debug and trace are for reading our own event flow. The
+                    // QUIC stack emits a span per datagram, which at trace fills
+                    // a megabyte every few minutes and buries the lines the
+                    // level was turned up to see.
+                    .level_for("quinn", log::LevelFilter::Warn)
+                    .level_for("quinn_proto", log::LevelFilter::Warn)
+                    .level_for("quinn_udp", log::LevelFilter::Warn)
+                    .level_for("tracing", log::LevelFilter::Warn)
+                    .level_for("tracing::span", log::LevelFilter::Warn)
+                    .level_for("tracing::span::active", log::LevelFilter::Warn)
+                    .level_for("rustls", log::LevelFilter::Warn)
+                    .level_for("hyper", log::LevelFilter::Warn)
+                    .level_for("reqwest", log::LevelFilter::Warn)
                     .max_file_size(LOG_MAX_FILE_SIZE_BYTES)
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                     .build(),
