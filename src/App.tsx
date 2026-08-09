@@ -1410,18 +1410,15 @@ function App() {
       return;
     }
 
-    // Capture arms a barrier on a local screen edge, so a link with no local
-    // end can never fire. Refuse it here rather than storing one that looks
-    // wired and quietly does nothing.
+    updateEdgeLinks((links) => connect(links, pendingAnchor, anchor));
+    setPendingAnchor(null);
+
+    // Worth saying out loud: such a link works, but only onward from a screen
+    // the cursor has already reached — it cannot be the first step from here.
     const localDeviceId = layout?.devices.find((device) => device.role === "local")?.id;
     if (pendingAnchor.deviceId !== localDeviceId && anchor.deviceId !== localDeviceId) {
       setEdgeNotice(ui.layout.edgesBothRemote);
-      setPendingAnchor(anchor);
-      return;
     }
-
-    updateEdgeLinks((links) => connect(links, pendingAnchor, anchor));
-    setPendingAnchor(null);
   }
 
   /** Double-click cuts a side where the pointer is, so it can feed two places. */
