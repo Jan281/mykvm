@@ -1631,12 +1631,28 @@ fn start_platform_capture(
     // The runtime signals a stop by flipping this flag. Drop the barriers when
     // it does, but leave the session open so turning sharing back on does not
     // ask the user for permission again.
+    //
+    // Only *our* barriers, though. Re-arming after a wiring change signals this
+    // flag and immediately arms the new set without waiting for this thread,
+    // which can be up to a poll behind — disarming unconditionally here tore
+    // down the barriers that had just replaced ours.
     {
+        let generation = armed
+            .as_ref()
+            .ok()
+            .map(|_| service.generation())
+            .unwrap_or_default();
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(200));
             }
-            service.disarm();
+            // Superseded rather than stopped: the capture that replaced us owns
+            // the barriers, the active flag and the clipboard target now, so
+            // clearing any of them here would undo its setup.
+            if service.generation() != generation {
+                return;
+            }
+            service.disarm_generation(generation);
             stopped_remote_active.store(false, Ordering::Relaxed);
             clear_clipboard_target(&stopped_clipboard_target);
         });
