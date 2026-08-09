@@ -1457,6 +1457,9 @@ fn start_platform_capture(
     // hand-over and whether it reaches the peer, without logging every sample.
     let mut motion_count: u64 = 0;
     let mut send_failures: u64 = 0;
+    // Which screen edge the cursor is currently stuck against, so the reason is
+    // logged once rather than per motion event.
+    let mut last_blocked_edge: Option<(String, Edge)> = None;
     let stopped_remote_active = Arc::clone(&remote_active);
     let stopped_clipboard_target = Arc::clone(&clipboard_target);
 
@@ -1520,9 +1523,6 @@ fn start_platform_capture(
                     // reaches the laptop both from below and from the right —
                     // and running off any of those sides has to bring the
                     // cursor home, not just retracing the way in.
-                    let max_x = (active_target.current_screen.width - 1) as f64;
-                    let max_y = (active_target.current_screen.height - 1) as f64;
-
                     if let Some((exit_target, local_x, local_y)) = linux_exit_return(
                         &targets,
                         &active_target.target.device_id,
@@ -1545,6 +1545,35 @@ fn start_platform_capture(
                         };
                     }
 
+                    // No way home here, so the cursor may still have somewhere
+                    // to go: another screen of this peer, or one of a different
+                    // peer that an edge link joins to this one.
+                    if linux_roam(active_target, &layout_state, &mut last_blocked_edge) {
+                        let sent = send_packet(
+                            &quic_transport,
+                            &active_target.target,
+                            InputEvent::MouseMove {
+                                screen_id: active_target.current_screen_id.clone(),
+                                x: active_target.x.round() as i32,
+                                y: active_target.y.round() as i32,
+                            },
+                            &layout_state,
+                            &input_events,
+                        );
+                        if !sent {
+                            send_failures += 1;
+                        }
+                        // The clipboard follows whoever holds the cursor.
+                        set_control_clipboard_target(
+                            &clipboard_target,
+                            active_target,
+                            &layout_state,
+                        );
+                        return Reaction::Continue;
+                    }
+
+                    let max_x = (active_target.current_screen.width - 1) as f64;
+                    let max_y = (active_target.current_screen.height - 1) as f64;
                     active_target.x = active_target.x.clamp(0.0, max_x);
                     active_target.y = active_target.y.clamp(0.0, max_y);
                     let sent = send_packet(
@@ -1788,6 +1817,125 @@ fn linux_edge_blocked_by<'a>(
     })
 }
 
+/// The layout screen a peer screen id refers to.
+///
+/// Ids sent on the wire have the device prefix stripped, while edge links name
+/// screens by their full layout id, so crossing between the two needs the
+/// device's own screen list.
+fn peer_screen_by_wire_id<'a>(
+    layout: &'a LayoutState,
+    device_id: &str,
+    wire_id: &str,
+) -> Option<&'a Screen> {
+    let device = layout.devices.iter().find(|device| device.id == device_id)?;
+    device
+        .screens
+        .iter()
+        .find(|screen| peer_screen_id(device, screen) == wire_id)
+}
+
+/// Where the cursor goes when it leaves a *remote* screen by `edge`, if a link
+/// leads somewhere that is not this machine.
+///
+/// Capture cannot start on such a link — there is no local edge to put a
+/// barrier on — but once the cursor is already out there, following one is just
+/// a matter of addressing the next packet to a different peer.
+fn peer_hop_destination<'a>(
+    layout: &'a LayoutState,
+    device_id: &str,
+    screen: &Screen,
+    edge: Edge,
+    fraction: f64,
+) -> Option<(&'a Device, &'a Screen, f64, f64)> {
+    let local_device_id = layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .map(|device| device.id.as_str())?;
+
+    for link in effective_edge_links(layout) {
+        // The end we are leaving from, and the end we would arrive at.
+        let (here, there) = if link.a.device_id == device_id
+            && link.a.screen_id == screen.id
+            && link.a.side == edge.as_side()
+        {
+            (&link.a, &link.b)
+        } else if link.b.device_id == device_id
+            && link.b.screen_id == screen.id
+            && link.b.side == edge.as_side()
+        {
+            (&link.b, &link.a)
+        } else {
+            continue;
+        };
+
+        // Going home is the other path's job; this one only handles peers.
+        if there.device_id == local_device_id {
+            continue;
+        }
+
+        let here_span = EdgeSpan::from_anchor(here);
+        if !here_span.contains(fraction) {
+            continue;
+        }
+
+        let Some(device) = layout.devices.iter().find(|device| {
+            device.id == there.device_id
+                && device.online
+                && device.input_ready
+                && device.protocol_version == quic_transport::PROTOCOL_VERSION
+                && !device.transport_public_key.trim().is_empty()
+        }) else {
+            continue;
+        };
+        let Some(destination) = device
+            .screens
+            .iter()
+            .find(|candidate| candidate.id == there.screen_id)
+        else {
+            continue;
+        };
+        let Some(arrival_edge) = Edge::from_side(&there.side) else {
+            continue;
+        };
+
+        let position = here_span.position_of(fraction);
+        let arrival_fraction = EdgeSpan::from_anchor(there).fraction_at(position);
+        let (x, y) = edge_entry_point(destination, arrival_edge, arrival_fraction);
+        return Some((device, destination, x, y));
+    }
+
+    None
+}
+
+/// Re-points an active hand-over at another peer, keeping the pairing context
+/// that is the same for every destination in the cluster.
+fn retarget_active_to_peer(
+    active: &mut ActiveTarget,
+    device: &Device,
+    screen: &Screen,
+    x: f64,
+    y: f64,
+) {
+    let wire_id = peer_screen_id(device, screen);
+    let quic_port = normalize_quic_port(device.transport_port, device.quic_port);
+
+    active.target.device_id = device.id.clone();
+    active.target.target_addr = format!("{}:{}", device.host, quic_port);
+    active.target.target_platform = device.platform.clone();
+    active.target.transport_public_key = device.transport_public_key.clone();
+    active.target.protocol_version = device.protocol_version;
+    active.target.screen_id = wire_id.clone();
+    active.target.remote_screen = screen.clone();
+
+    let mut current = screen.clone();
+    current.id = wire_id.clone();
+    active.current_screen = current;
+    active.current_screen_id = wire_id;
+    active.x = x;
+    active.y = y;
+}
+
 /// Resolves a barrier activation into the hand-over it stands for.
 ///
 /// The compositor already told us *which* barrier fired, and each barrier
@@ -1884,6 +2032,113 @@ fn linux_entry_from_barrier(
 /// How far a reported overshoot may push the cursor into the remote screen.
 #[cfg(target_os = "linux")]
 const MAX_ENTRY_PUSH: f64 = 40.0;
+
+/// Moves the cursor onto whatever screen lies past the edge it just ran off,
+/// if anything does.
+///
+/// Two kinds of neighbour count. A screen of the same device that simply sits
+/// there is reached by geometry, the way the peer's own desktop is arranged.
+/// A screen of *another* device is reached only through an edge link, because
+/// nothing about the two layouts says they are adjacent.
+///
+/// Returns true when the cursor moved; the caller keeps capture either way.
+#[cfg(target_os = "linux")]
+fn linux_roam(
+    active: &mut ActiveTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    last_blocked_edge: &mut Option<(String, Edge)>,
+) -> bool {
+    let max_x = (active.current_screen.width - 1) as f64;
+    let max_y = (active.current_screen.height - 1) as f64;
+
+    let (left_by, fraction) = if active.x < 0.0 {
+        (Edge::Left, active.y / max_y.max(1.0))
+    } else if active.x > max_x {
+        (Edge::Right, active.y / max_y.max(1.0))
+    } else if active.y < 0.0 {
+        (Edge::Top, active.x / max_x.max(1.0))
+    } else if active.y > max_y {
+        (Edge::Bottom, active.x / max_x.max(1.0))
+    } else {
+        return false;
+    };
+    let fraction = fraction.clamp(0.0, 1.0);
+
+    // Never block the event stream on a held layout lock; the cursor simply
+    // stays put for this event and the next one tries again.
+    let Ok(layout) = layout_state.try_lock() else {
+        return false;
+    };
+
+    let device_id = active.target.device_id.clone();
+    let Some(current) = peer_screen_by_wire_id(&layout, &device_id, &active.current_screen_id)
+    else {
+        return false;
+    };
+
+    // Same device first: its screens share one coordinate space, so the point
+    // the cursor has walked to says which one it is on now.
+    let global_x = current.x as f64 + active.x;
+    let global_y = current.y as f64 + active.y;
+    if let Some(device) = layout.devices.iter().find(|device| device.id == device_id) {
+        if let Some(neighbour) = device.screens.iter().find(|screen| {
+            screen.id != current.id && point_in_screen(screen, global_x, global_y)
+        }) {
+            let wire_id = peer_screen_id(device, neighbour);
+            log::info!(
+                "[wayland] roaming to {} on the same device at ({:.0},{:.0})",
+                neighbour.name,
+                global_x - neighbour.x as f64,
+                global_y - neighbour.y as f64,
+            );
+            let mut screen = neighbour.clone();
+            screen.id = wire_id.clone();
+            active.x = global_x - neighbour.x as f64;
+            active.y = global_y - neighbour.y as f64;
+            active.current_screen = screen;
+            active.current_screen_id = wire_id;
+            return true;
+        }
+    }
+
+    let Some((device, destination, x, y)) =
+        peer_hop_destination(&layout, &device_id, current, left_by, fraction)
+    else {
+        // Walking into a wall is normal, but a wall where a link was expected
+        // is not, and nothing about it is visible from the outside. Say once
+        // per edge what was looked for and what the links offer instead.
+        if last_blocked_edge
+            .as_ref()
+            .map(|(screen, edge)| screen != &current.id || *edge != left_by)
+            .unwrap_or(true)
+        {
+            let offered: Vec<String> = effective_edge_links(&layout)
+                .iter()
+                .flat_map(|link| [link.a.clone(), link.b.clone()])
+                .filter(|anchor| anchor.screen_id == current.id)
+                .map(|anchor| anchor.side.clone())
+                .collect();
+            log::debug!(
+                "[wayland] no way out of {} via its {:?} edge; links on this screen cover {:?}",
+                current.name,
+                left_by,
+                offered
+            );
+        }
+        *last_blocked_edge = Some((current.id.clone(), left_by));
+        return false;
+    };
+
+    log::info!(
+        "[wayland] hopping to device={} screen={} at ({x:.0},{y:.0})",
+        device.name,
+        destination.name,
+    );
+    let (device, destination) = (device.clone(), destination.clone());
+    drop(layout);
+    retarget_active_to_peer(active, &device, &destination, x, y);
+    true
+}
 
 /// A small step outward through `edge`, used to ask the shared crossing logic
 /// which remote screen a barrier hand-off lands on.
@@ -2077,12 +2332,11 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
         } else if link.b.device_id == local_device.id {
             (&link.b, &link.a)
         } else {
-            log::warn!(
-                "[wayland] link {} joins two remote screens ({} and {}); neither end is a local screen edge, so nothing can be armed for it",
-                link.id,
-                link.a.screen_id,
-                link.b.screen_id,
-            );
+            // A hop between peers, followed once the cursor is already out
+            // there. It carries no barrier, which is not worth a word: this
+            // runs from the once-a-second wiring check, and saying so there
+            // rotated the log fast enough to discard the crossings being
+            // diagnosed.
             continue;
         };
         if remote_anchor.device_id == local_device.id {
@@ -4720,14 +4974,26 @@ fn edge_entry_point(screen: &Screen, edge: Edge, fraction: f64) -> (f64, f64) {
 fn edge_entry_point_pushed(screen: &Screen, edge: Edge, fraction: f64, push: f64) -> (f64, f64) {
     let max_x = (screen.width - 1).max(0) as f64;
     let max_y = (screen.height - 1).max(0) as f64;
-    let along = fraction.clamp(0.0, 1.0);
     let inward = 1.0 + push.abs();
 
+    // Arriving in the very corner is a trap: the position along the edge would
+    // sit on the first or last row, and the same movement that carried the
+    // cursor in then carries it straight back out of the *adjacent* edge. So
+    // keep a pixel of margin at both ends — crossing at the bottom of one
+    // screen still arrives at the bottom of the next, just not past it.
+    let along = |extent: f64| {
+        if extent <= 2.0 {
+            extent / 2.0
+        } else {
+            (fraction.clamp(0.0, 1.0) * extent).clamp(1.0, extent - 1.0)
+        }
+    };
+
     match edge {
-        Edge::Top => (along * max_x, inward.min(max_y)),
-        Edge::Bottom => (along * max_x, (max_y - inward).max(0.0)),
-        Edge::Left => (inward.min(max_x), along * max_y),
-        Edge::Right => ((max_x - inward).max(0.0), along * max_y),
+        Edge::Top => (along(max_x), inward.min(max_y)),
+        Edge::Bottom => (along(max_x), (max_y - inward).max(0.0)),
+        Edge::Left => (inward.min(max_x), along(max_y)),
+        Edge::Right => ((max_x - inward).max(0.0), along(max_y)),
     }
 }
 
@@ -8588,6 +8854,165 @@ mod tests {
         // the user can make, not a layout we should second-guess.
         layout.edge_links = Some(Vec::new());
         assert!(build_input_targets(&layout, &layout).is_empty());
+    }
+
+    /// Two peers side by side with no local edge between them: reaching the
+    /// second is only possible by walking off the first.
+    #[cfg(target_os = "linux")]
+    fn layout_for_hop_tests() -> LayoutState {
+        let mut layout = layout_for_target_tests();
+        let template = layout.devices[1].clone();
+        layout.devices.push(Device {
+            id: "peer-far".into(),
+            name: "Far".into(),
+            host: "10.0.0.3".into(),
+            transport_public_key: "far-public-key".into(),
+            screens: vec![screen("peer-far", "peer-far-local-display-1", 3840, 0, 1920, 1080)],
+            ..template
+        });
+
+        layout.edge_links = Some(vec![EdgeLink {
+            id: "hop".into(),
+            a: EdgeAnchor {
+                device_id: "peer-device".into(),
+                screen_id: "peer-device-local-display-1".into(),
+                side: "right".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+            b: EdgeAnchor {
+                device_id: "peer-far".into(),
+                screen_id: "peer-far-local-display-1".into(),
+                side: "left".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+        }]);
+        layout
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn walking_off_one_peer_hops_to_the_peer_linked_to_it() {
+        let layout = layout_for_hop_tests();
+        let state = Arc::new(Mutex::new(layout));
+        let mut active = active_target_at(&target_for_coordinate_tests(), 1919.0, 540.0, false);
+        active.current_screen_id = "local-display-1".into();
+        active.current_screen =
+            screen("peer-device", "local-display-1", 1920, 0, 1920, 1080);
+
+        // Off the right-hand side of the first peer.
+        active.x = 1925.0;
+        assert!(linux_roam(&mut active, &state, &mut None), "the cursor should hop");
+
+        // It is now addressed to the other machine entirely.
+        assert_eq!(active.target.device_id, "peer-far");
+        assert_eq!(active.target.target_addr, "10.0.0.3:52001");
+        assert_eq!(active.target.transport_public_key, "far-public-key");
+        // Arriving just inside the destination's left edge, same height.
+        assert!(active.x <= 2.0, "entered at x={}", active.x);
+        assert!((active.y - 540.0).abs() < 2.0, "entered at y={}", active.y);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hop_needs_a_link_and_a_reachable_peer() {
+        // No link on the side the cursor left by: it stays where it is.
+        let state = Arc::new(Mutex::new(layout_for_hop_tests()));
+        let mut active = active_target_at(&target_for_coordinate_tests(), 960.0, 0.0, false);
+        active.current_screen_id = "local-display-1".into();
+        active.current_screen =
+            screen("peer-device", "local-display-1", 1920, 0, 1920, 1080);
+        active.y = -5.0;
+        assert!(!linux_roam(&mut active, &state, &mut None));
+
+        // Link present, but the destination is offline.
+        let mut layout = layout_for_hop_tests();
+        layout.devices[2].online = false;
+        let state = Arc::new(Mutex::new(layout));
+        let mut active = active_target_at(&target_for_coordinate_tests(), 1919.0, 540.0, false);
+        active.current_screen_id = "local-display-1".into();
+        active.current_screen =
+            screen("peer-device", "local-display-1", 1920, 0, 1920, 1080);
+        active.x = 1925.0;
+        assert!(!linux_roam(&mut active, &state, &mut None));
+        assert_eq!(active.target.device_id, "peer-device");
+    }
+
+    /// The real desk: the laptop's three panels under the 4K one, and a second
+    /// laptop to the right of the third panel with no local edge of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hopping_from_the_third_laptop_panel_to_the_machine_beside_it() {
+        let mut layout = layout_for_target_tests();
+        let template = layout.devices[1].clone();
+        layout.devices[1] = Device {
+            id: "peer-laptop".into(),
+            name: "LDE-C1177D3".into(),
+            screens: vec![
+                screen("peer-laptop", "peer-laptop-local-display-1", 2200, 3500, 1920, 1200),
+                screen("peer-laptop", "peer-laptop-local-display-2", 280, 3500, 1920, 1080),
+                screen("peer-laptop", "peer-laptop-local-display-3", 4120, 3500, 1920, 1080),
+            ],
+            ..template.clone()
+        };
+        layout.devices.push(Device {
+            id: "peer-dhl".into(),
+            name: "LDE-DHL3T74".into(),
+            host: "192.168.1.135".into(),
+            transport_public_key: "dhl-public-key".into(),
+            screens: vec![screen("peer-dhl", "peer-dhl-local-display-1", 6240, 3340, 1920, 1080)],
+            ..template
+        });
+        layout.edge_links = Some(vec![EdgeLink {
+            id: "hop".into(),
+            a: EdgeAnchor {
+                device_id: "peer-laptop".into(),
+                screen_id: "peer-laptop-local-display-3".into(),
+                side: "right".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+            b: EdgeAnchor {
+                device_id: "peer-dhl".into(),
+                screen_id: "peer-dhl-local-display-1".into(),
+                side: "left".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+        }]);
+        let state = Arc::new(Mutex::new(layout));
+
+        // On the third panel, walking off its right-hand side.
+        let mut active = active_target_at(&target_for_coordinate_tests(), 1919.0, 500.0, false);
+        active.target.device_id = "peer-laptop".into();
+        active.current_screen_id = "local-display-3".into();
+        active.current_screen =
+            screen("peer-laptop", "local-display-3", 4120, 3500, 1920, 1080);
+        active.x = 1924.0;
+
+        assert!(linux_roam(&mut active, &state, &mut None), "the cursor should hop");
+        assert_eq!(active.target.device_id, "peer-dhl");
+        assert_eq!(active.target.target_addr, "192.168.1.135:52001");
+    }
+
+    #[test]
+    fn an_arrival_never_lands_in_the_corner_it_would_fall_out_of() {
+        // Regression: crossing at the very bottom of one screen's right edge
+        // put the cursor on the last row of the next, and the same downward
+        // drift that carried it over then pushed it straight out of that
+        // screen's bottom edge — surfacing on whatever that edge links to.
+        let target = screen("peer", "display", 0, 0, 1920, 1080);
+
+        let (_, y) = edge_entry_point(&target, Edge::Left, 1.0);
+        assert!(y < 1079.0, "arrived on the last row at y={y}");
+        assert!(y >= 1078.0, "should still arrive near the bottom, got {y}");
+
+        let (_, y) = edge_entry_point(&target, Edge::Left, 0.0);
+        assert!(y > 0.0, "arrived on the first row at y={y}");
+
+        let (x, _) = edge_entry_point(&target, Edge::Top, 1.0);
+        assert!(x < 1919.0, "arrived in the right-hand column at x={x}");
     }
 
     #[cfg(target_os = "linux")]
