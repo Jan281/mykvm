@@ -1457,6 +1457,9 @@ fn start_platform_capture(
     // hand-over and whether it reaches the peer, without logging every sample.
     let mut motion_count: u64 = 0;
     let mut send_failures: u64 = 0;
+    // Which screen edge the cursor is currently stuck against, so the reason is
+    // logged once rather than per motion event.
+    let mut last_blocked_edge: Option<(String, Edge)> = None;
     let stopped_remote_active = Arc::clone(&remote_active);
     let stopped_clipboard_target = Arc::clone(&clipboard_target);
 
@@ -1545,7 +1548,7 @@ fn start_platform_capture(
                     // No way home here, so the cursor may still have somewhere
                     // to go: another screen of this peer, or one of a different
                     // peer that an edge link joins to this one.
-                    if linux_roam(active_target, &layout_state) {
+                    if linux_roam(active_target, &layout_state, &mut last_blocked_edge) {
                         let sent = send_packet(
                             &quic_transport,
                             &active_target.target,
@@ -2040,7 +2043,11 @@ const MAX_ENTRY_PUSH: f64 = 40.0;
 ///
 /// Returns true when the cursor moved; the caller keeps capture either way.
 #[cfg(target_os = "linux")]
-fn linux_roam(active: &mut ActiveTarget, layout_state: &Arc<Mutex<LayoutState>>) -> bool {
+fn linux_roam(
+    active: &mut ActiveTarget,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    last_blocked_edge: &mut Option<(String, Edge)>,
+) -> bool {
     let max_x = (active.current_screen.width - 1) as f64;
     let max_y = (active.current_screen.height - 1) as f64;
 
@@ -2097,6 +2104,28 @@ fn linux_roam(active: &mut ActiveTarget, layout_state: &Arc<Mutex<LayoutState>>)
     let Some((device, destination, x, y)) =
         peer_hop_destination(&layout, &device_id, current, left_by, fraction)
     else {
+        // Walking into a wall is normal, but a wall where a link was expected
+        // is not, and nothing about it is visible from the outside. Say once
+        // per edge what was looked for and what the links offer instead.
+        if last_blocked_edge
+            .as_ref()
+            .map(|(screen, edge)| screen != &current.id || *edge != left_by)
+            .unwrap_or(true)
+        {
+            let offered: Vec<String> = effective_edge_links(&layout)
+                .iter()
+                .flat_map(|link| [link.a.clone(), link.b.clone()])
+                .filter(|anchor| anchor.screen_id == current.id)
+                .map(|anchor| anchor.side.clone())
+                .collect();
+            log::debug!(
+                "[wayland] no way out of {} via its {:?} edge; links on this screen cover {:?}",
+                current.name,
+                left_by,
+                offered
+            );
+        }
+        *last_blocked_edge = Some((current.id.clone(), left_by));
         return false;
     };
 
@@ -8865,7 +8894,7 @@ mod tests {
 
         // Off the right-hand side of the first peer.
         active.x = 1925.0;
-        assert!(linux_roam(&mut active, &state), "the cursor should hop");
+        assert!(linux_roam(&mut active, &state, &mut None), "the cursor should hop");
 
         // It is now addressed to the other machine entirely.
         assert_eq!(active.target.device_id, "peer-far");
@@ -8886,7 +8915,7 @@ mod tests {
         active.current_screen =
             screen("peer-device", "local-display-1", 1920, 0, 1920, 1080);
         active.y = -5.0;
-        assert!(!linux_roam(&mut active, &state));
+        assert!(!linux_roam(&mut active, &state, &mut None));
 
         // Link present, but the destination is offline.
         let mut layout = layout_for_hop_tests();
@@ -8897,8 +8926,65 @@ mod tests {
         active.current_screen =
             screen("peer-device", "local-display-1", 1920, 0, 1920, 1080);
         active.x = 1925.0;
-        assert!(!linux_roam(&mut active, &state));
+        assert!(!linux_roam(&mut active, &state, &mut None));
         assert_eq!(active.target.device_id, "peer-device");
+    }
+
+    /// The real desk: the laptop's three panels under the 4K one, and a second
+    /// laptop to the right of the third panel with no local edge of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hopping_from_the_third_laptop_panel_to_the_machine_beside_it() {
+        let mut layout = layout_for_target_tests();
+        let template = layout.devices[1].clone();
+        layout.devices[1] = Device {
+            id: "peer-laptop".into(),
+            name: "LDE-C1177D3".into(),
+            screens: vec![
+                screen("peer-laptop", "peer-laptop-local-display-1", 2200, 3500, 1920, 1200),
+                screen("peer-laptop", "peer-laptop-local-display-2", 280, 3500, 1920, 1080),
+                screen("peer-laptop", "peer-laptop-local-display-3", 4120, 3500, 1920, 1080),
+            ],
+            ..template.clone()
+        };
+        layout.devices.push(Device {
+            id: "peer-dhl".into(),
+            name: "LDE-DHL3T74".into(),
+            host: "192.168.1.135".into(),
+            transport_public_key: "dhl-public-key".into(),
+            screens: vec![screen("peer-dhl", "peer-dhl-local-display-1", 6240, 3340, 1920, 1080)],
+            ..template
+        });
+        layout.edge_links = Some(vec![EdgeLink {
+            id: "hop".into(),
+            a: EdgeAnchor {
+                device_id: "peer-laptop".into(),
+                screen_id: "peer-laptop-local-display-3".into(),
+                side: "right".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+            b: EdgeAnchor {
+                device_id: "peer-dhl".into(),
+                screen_id: "peer-dhl-local-display-1".into(),
+                side: "left".into(),
+                start: 0.0,
+                end: 1.0,
+            },
+        }]);
+        let state = Arc::new(Mutex::new(layout));
+
+        // On the third panel, walking off its right-hand side.
+        let mut active = active_target_at(&target_for_coordinate_tests(), 1919.0, 500.0, false);
+        active.target.device_id = "peer-laptop".into();
+        active.current_screen_id = "local-display-3".into();
+        active.current_screen =
+            screen("peer-laptop", "local-display-3", 4120, 3500, 1920, 1080);
+        active.x = 1924.0;
+
+        assert!(linux_roam(&mut active, &state, &mut None), "the cursor should hop");
+        assert_eq!(active.target.device_id, "peer-dhl");
+        assert_eq!(active.target.target_addr, "192.168.1.135:52001");
     }
 
     #[cfg(target_os = "linux")]
