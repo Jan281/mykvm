@@ -4974,14 +4974,26 @@ fn edge_entry_point(screen: &Screen, edge: Edge, fraction: f64) -> (f64, f64) {
 fn edge_entry_point_pushed(screen: &Screen, edge: Edge, fraction: f64, push: f64) -> (f64, f64) {
     let max_x = (screen.width - 1).max(0) as f64;
     let max_y = (screen.height - 1).max(0) as f64;
-    let along = fraction.clamp(0.0, 1.0);
     let inward = 1.0 + push.abs();
 
+    // Arriving in the very corner is a trap: the position along the edge would
+    // sit on the first or last row, and the same movement that carried the
+    // cursor in then carries it straight back out of the *adjacent* edge. So
+    // keep a pixel of margin at both ends — crossing at the bottom of one
+    // screen still arrives at the bottom of the next, just not past it.
+    let along = |extent: f64| {
+        if extent <= 2.0 {
+            extent / 2.0
+        } else {
+            (fraction.clamp(0.0, 1.0) * extent).clamp(1.0, extent - 1.0)
+        }
+    };
+
     match edge {
-        Edge::Top => (along * max_x, inward.min(max_y)),
-        Edge::Bottom => (along * max_x, (max_y - inward).max(0.0)),
-        Edge::Left => (inward.min(max_x), along * max_y),
-        Edge::Right => ((max_x - inward).max(0.0), along * max_y),
+        Edge::Top => (along(max_x), inward.min(max_y)),
+        Edge::Bottom => (along(max_x), (max_y - inward).max(0.0)),
+        Edge::Left => (inward.min(max_x), along(max_y)),
+        Edge::Right => ((max_x - inward).max(0.0), along(max_y)),
     }
 }
 
@@ -8982,6 +8994,25 @@ mod tests {
         assert!(linux_roam(&mut active, &state, &mut None), "the cursor should hop");
         assert_eq!(active.target.device_id, "peer-dhl");
         assert_eq!(active.target.target_addr, "192.168.1.135:52001");
+    }
+
+    #[test]
+    fn an_arrival_never_lands_in_the_corner_it_would_fall_out_of() {
+        // Regression: crossing at the very bottom of one screen's right edge
+        // put the cursor on the last row of the next, and the same downward
+        // drift that carried it over then pushed it straight out of that
+        // screen's bottom edge — surfacing on whatever that edge links to.
+        let target = screen("peer", "display", 0, 0, 1920, 1080);
+
+        let (_, y) = edge_entry_point(&target, Edge::Left, 1.0);
+        assert!(y < 1079.0, "arrived on the last row at y={y}");
+        assert!(y >= 1078.0, "should still arrive near the bottom, got {y}");
+
+        let (_, y) = edge_entry_point(&target, Edge::Left, 0.0);
+        assert!(y > 0.0, "arrived on the first row at y={y}");
+
+        let (x, _) = edge_entry_point(&target, Edge::Top, 1.0);
+        assert!(x < 1919.0, "arrived in the right-hand column at x={x}");
     }
 
     #[cfg(target_os = "linux")]
