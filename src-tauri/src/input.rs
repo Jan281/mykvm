@@ -20,7 +20,7 @@ use crate::{
     Device, EdgeAnchor, EdgeLink, LayoutState, NativeStageStatus, Screen,
 };
 
-const INPUT_PROTOCOL: &str = "mykvm.input.v1";
+use mykvm_protocol::packet::INPUT_PROTOCOL;
 const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
 const EDGE_TOLERANCE: i32 = 80;
 // The cursor must reach the very edge pixel before a crossing is considered.

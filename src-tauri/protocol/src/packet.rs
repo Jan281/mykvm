@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::discovery::default_protocol_version;
 use crate::input::InputEvent;
 
+/// Marker in every input datagram; a packet without it is not input.
+pub const INPUT_PROTOCOL: &str = "mykvm.input.v1";
+
 fn str_ref_is_empty(value: &&str) -> bool {
     value.is_empty()
 }

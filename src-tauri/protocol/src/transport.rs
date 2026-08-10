@@ -44,8 +44,8 @@ const MAX_HEALTH_PEERS: usize = 64;
 // in-flight count so a burst cannot spawn unbounded copies of a 48MB write.
 const MAX_CONCURRENT_STREAMS: usize = 8;
 
-type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
-type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
+pub type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
+pub type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {

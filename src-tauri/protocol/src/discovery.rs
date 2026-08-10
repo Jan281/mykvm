@@ -165,9 +165,52 @@ fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<Strin
     targets
 }
 
+/// Folds any label into the id alphabet: lowercase ASCII alphanumerics, every
+/// other character becoming a separator.
+pub fn sanitize_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// The id a peer announces itself under, derived from its hostname and address.
+///
+/// Every client must build this the same way down to the character: the
+/// receiving side addresses input packets by this exact string, and a packet
+/// whose `targetDeviceId` does not match is dropped without a word.
+pub fn local_peer_id(host: &str, ip: &str) -> String {
+    let normalized = sanitize_id(&format!("{host}-{ip}"));
+
+    if normalized.is_empty() {
+        "peer-local".into()
+    } else {
+        format!("peer-{normalized}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_id_matches_the_shape_every_client_must_produce() {
+        assert_eq!(
+            local_peer_id("LDE-C1177D3", "192.168.0.117"),
+            "peer-lde-c1177d3-192-168-0-117"
+        );
+        // Nothing usable in either part must still yield a legal id.
+        assert_eq!(local_peer_id("", ""), "peer-local");
+    }
 
     #[test]
     fn discovery_target_ports_spans_neighbouring_ports() {

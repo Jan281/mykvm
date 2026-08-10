@@ -36,7 +36,8 @@ pub use mykvm_protocol::transport as quic_transport;
 use mykvm_protocol::discovery::{
     broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
     normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
-    DiscoveryPacket, LanPeer, LanPeerScreen, DISCOVERY_PROTOCOL, TRANSPORT_PORT_MAX,
+    local_peer_id, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen, DISCOVERY_PROTOCOL,
+    TRANSPORT_PORT_MAX,
 };
 #[cfg(target_os = "windows")]
 pub mod windows_input;
@@ -5807,22 +5808,6 @@ fn peer_device_id(peer: &LanPeer) -> String {
     }
 }
 
-fn sanitize_id(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.online = true;
     device.input_ready = peer.input_ready;
@@ -6042,28 +6027,6 @@ fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
         height: screen.height,
         scale: screen.scale,
         is_primary: screen.is_primary,
-    }
-}
-
-fn local_peer_id(host: &str, ip: &str) -> String {
-    let seed = format!("{host}-{ip}");
-    let normalized = seed
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-
-    if normalized.is_empty() {
-        "peer-local".into()
-    } else {
-        format!("peer-{normalized}")
     }
 }
 
