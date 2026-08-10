@@ -5,6 +5,8 @@
 //! that says "I exist, here is my certificate and my screens", after which all
 //! real traffic goes over QUIC (see [`crate::transport`]).
 
+use std::net::{Ipv4Addr, UdpSocket};
+
 use serde::{Deserialize, Serialize};
 
 /// Default UDP port for the discovery heartbeat.
@@ -15,6 +17,212 @@ pub const DISCOVERY_PORT: u16 = 47833;
 
 /// Marker in every discovery datagram. A packet without it is not ours.
 pub const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
+
+/// A peer that wanted the discovery port but found it taken drifts upward. We
+/// aim discovery traffic at this many consecutive ports starting from the
+/// configured base, so two peers that landed on different ports still reach
+/// each other.
+pub const DISCOVERY_PORT_SPAN: u16 = 8;
+
+pub const TRANSPORT_PORT_MIN: u16 = 1024;
+pub const TRANSPORT_PORT_MAX: u16 = 65_535;
+
+pub fn normalize_transport_port(port: u16) -> u16 {
+    port.clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
+}
+
+pub fn preferred_quic_port(discovery_port: u16) -> u16 {
+    discovery_port
+        .saturating_add(1)
+        .clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
+}
+
+pub fn normalize_quic_port(discovery_port: u16, quic_port: u16) -> u16 {
+    if quic_port == 0 {
+        preferred_quic_port(discovery_port)
+    } else {
+        normalize_transport_port(quic_port)
+    }
+}
+
+/// The consecutive discovery ports we aim traffic at, starting from `base`.
+pub fn discovery_target_ports(base: u16) -> Vec<u16> {
+    let base = normalize_transport_port(base);
+    let mut ports = Vec::new();
+    for offset in 0..DISCOVERY_PORT_SPAN {
+        let Some(port) = base.checked_add(offset) else {
+            break;
+        };
+        if port > TRANSPORT_PORT_MAX {
+            break;
+        }
+        ports.push(port);
+    }
+    ports
+}
+
+pub fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
+    !address.is_loopback()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !address.is_link_local()
+}
+
+/// Asking the routing table which source address would reach the internet. No
+/// packet is sent — connecting a UDP socket only picks a route.
+fn default_route_ipv4_address() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let address = socket.local_addr().ok()?;
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// Every usable local IPv4 address, default route first.
+pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut addresses = Vec::new();
+
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            if interface.is_loopback() {
+                continue;
+            }
+
+            let if_addrs::IfAddr::V4(address) = interface.addr else {
+                continue;
+            };
+            if usable_discovery_ipv4(address.ip) {
+                addresses.push(address.ip);
+            }
+        }
+    }
+
+    if let Some(default_ip) = default_route_ipv4_address() {
+        if usable_discovery_ipv4(default_ip) {
+            addresses.insert(0, default_ip);
+        }
+    }
+
+    addresses.sort_by_key(|address| address.octets());
+    addresses.dedup();
+    addresses
+}
+
+/// Broadcast destinations for discovery, fanned out across the discovery port
+/// span. Sending to the whole span — rather than a single port — lets us reach
+/// peers that drifted onto a neighbouring port when their preferred port was
+/// momentarily taken.
+pub fn broadcast_addrs(base_port: u16) -> Vec<String> {
+    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
+}
+
+fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for port in discovery_target_ports(base_port) {
+        addresses.push(format!("255.255.255.255:{port}"));
+        for ip in local_ips {
+            let [a, b, c, _] = ip.octets();
+            addresses.push(format!("{a}.{b}.{c}.255:{port}"));
+        }
+    }
+
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+/// Every other host address in our local /24, used as a fallback when a network
+/// drops broadcast traffic (common with Wi-Fi "AP/client isolation" and some
+/// managed switches) but still forwards unicast between clients.
+pub fn unicast_sweep_targets(port: u16) -> Vec<String> {
+    unicast_sweep_targets_for_ips(port, &local_ipv4_addresses())
+}
+
+fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
+    let ports = discovery_target_ports(port);
+    let mut targets = Vec::new();
+
+    for ip in local_ips {
+        let [a, b, c, self_host] = ip.octets();
+        let subnet_prefix = format!("{a}.{b}.{c}");
+        targets.extend(
+            (1..=254u8)
+                .filter(|host| *host != self_host)
+                .flat_map(|host| {
+                    let subnet_prefix = subnet_prefix.clone();
+                    ports
+                        .iter()
+                        .map(move |port| format!("{subnet_prefix}.{host}:{port}"))
+                }),
+        );
+    }
+
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_target_ports_spans_neighbouring_ports() {
+        let ports = discovery_target_ports(DISCOVERY_PORT);
+        assert_eq!(ports.len(), DISCOVERY_PORT_SPAN as usize);
+        assert_eq!(ports[0], DISCOVERY_PORT);
+        // A peer that drifted from 47833 to 47834 must still be a target.
+        assert!(ports.contains(&(DISCOVERY_PORT + 1)));
+        assert_eq!(
+            *ports.last().unwrap(),
+            DISCOVERY_PORT + DISCOVERY_PORT_SPAN - 1
+        );
+    }
+
+    #[test]
+    fn discovery_target_ports_clamp_near_max() {
+        let ports = discovery_target_ports(TRANSPORT_PORT_MAX - 1);
+        assert_eq!(ports, vec![TRANSPORT_PORT_MAX - 1, TRANSPORT_PORT_MAX]);
+    }
+
+    #[test]
+    fn broadcast_addrs_reach_a_drifted_peer_port() {
+        // The exact failure we are fixing: one peer on 47833 must still address a
+        // peer that landed on 47834, via the global broadcast target.
+        let addrs = broadcast_addrs(DISCOVERY_PORT);
+        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("255.255.255.255:{}", DISCOVERY_PORT + 1)));
+    }
+
+    #[test]
+    fn broadcast_addrs_include_every_local_ipv4_subnet() {
+        let addrs = broadcast_addrs_for_ips(
+            DISCOVERY_PORT,
+            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
+        );
+
+        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("192.168.66.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("10.0.0.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("192.168.66.255:{}", DISCOVERY_PORT + 1)));
+    }
+
+    #[test]
+    fn unicast_sweep_targets_cover_every_local_ipv4_subnet() {
+        let targets = unicast_sweep_targets_for_ips(
+            DISCOVERY_PORT,
+            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
+        );
+
+        assert!(targets.contains(&format!("192.168.66.92:{DISCOVERY_PORT}")));
+        assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
+        assert!(!targets.contains(&format!("192.168.66.106:{DISCOVERY_PORT}")));
+        assert!(!targets.contains(&format!("10.0.0.4:{DISCOVERY_PORT}")));
+    }
+}
 
 pub fn default_transport_port() -> u16 {
     DISCOVERY_PORT
