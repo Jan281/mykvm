@@ -251,13 +251,19 @@ fn spawn_discovery(
                     continue;
                 }
 
+                // Our own broadcast comes straight back to us; without this we
+                // would list ourselves as a peer and answer our own announce.
+                if incoming.peer.id == device_id {
+                    continue;
+                }
+
                 remember_peer(&peers_seen, &incoming.peer);
 
                 if matches!(incoming.kind.as_str(), "announce" | "probe") {
                     let peer = build_peer(
                         &device_id, &name, &ip, base_port, &transport, width, height,
                     );
-                    reply(&socket, &peer, from);
+                    reply(&socket, &peer, from, &incoming.peer.ip, base_port);
                 }
             }
 
@@ -344,14 +350,76 @@ fn broadcast(socket: &UdpSocket, peer: &LanPeer, base_port: u16) {
     let Ok(payload) = rmp_serde::to_vec_named(&packet_for(peer, "announce")) else {
         return;
     };
-    for address in broadcast_addrs(base_port) {
-        let _ = socket.send_to(&payload, &address);
+
+    let targets = broadcast_addrs(base_port);
+    let mut sent = 0usize;
+    let mut first_error: Option<(String, String)> = None;
+
+    for address in &targets {
+        match socket.send_to(&payload, address) {
+            Ok(_) => sent += 1,
+            Err(error) => {
+                first_error.get_or_insert_with(|| (address.clone(), error.to_string()));
+            }
+        }
+    }
+
+    // Announcing into a void looks identical to working, from the inside. Say
+    // so once per state change instead of letting a VPN or a firewall silently
+    // eat everything.
+    report_broadcast_health(sent, targets.len(), first_error);
+}
+
+/// Logs only when the picture changes, so a healthy loop stays quiet.
+fn report_broadcast_health(sent: usize, total: usize, error: Option<(String, String)>) {
+    use std::sync::atomic::AtomicUsize;
+    static LAST_SENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    if LAST_SENT.swap(sent, Ordering::Relaxed) == sent {
+        return;
+    }
+
+    match error {
+        Some((address, reason)) if sent == 0 => {
+            log::warn!("[core] every announce failed ({total} targets), e.g. {address}: {reason}")
+        }
+        Some((address, reason)) => {
+            log::warn!("[core] announced to {sent}/{total} targets; {address} failed: {reason}")
+        }
+        None => log::info!("[core] announcing to {sent} targets"),
     }
 }
 
-fn reply(socket: &UdpSocket, peer: &LanPeer, to: SocketAddr) {
-    if let Ok(payload) = rmp_serde::to_vec_named(&packet_for(peer, "announce")) {
-        let _ = socket.send_to(&payload, to);
+/// Answers a peer both at the address its packet came from and at the address
+/// it advertises, across the whole discovery port span.
+///
+/// The advertised path is what makes this work at all on Jan's network: the
+/// access point forwards broadcasts from wired to wireless but not back, so the
+/// phone hears the desktop while everything it broadcasts disappears. Unicast
+/// crosses fine — proven by ping — so answering directly is the way in. The
+/// source address alone is not enough, because the desktop scans from an
+/// ephemeral socket that nobody reads replies on.
+fn reply(socket: &UdpSocket, peer: &LanPeer, from: SocketAddr, advertised_ip: &str, base_port: u16) {
+    let Ok(payload) = rmp_serde::to_vec_named(&packet_for(peer, "announce")) else {
+        return;
+    };
+
+    let _ = socket.send_to(&payload, from);
+
+    // The source address is the one we know is routable — the packet just came
+    // from it. The advertised one may be on an interface we cannot reach at
+    // all: a desktop with several VLANs announces whichever address its default
+    // route picked, which here is a different subnet than the phone's Wi-Fi.
+    let mut destinations = vec![from.ip().to_string()];
+    let advertised_ip = advertised_ip.trim();
+    if !advertised_ip.is_empty() && advertised_ip != destinations[0] {
+        destinations.push(advertised_ip.to_string());
+    }
+
+    for address in destinations {
+        for port in discovery_target_ports(base_port) {
+            let _ = socket.send_to(&payload, (address.as_str(), port));
+        }
     }
 }
 

@@ -81,9 +81,51 @@ fn default_route_ipv4_address() -> Option<Ipv4Addr> {
     }
 }
 
-/// Every usable local IPv4 address, default route first.
+/// Orders candidates so that addresses on a real subnet come before
+/// point-to-point ones, and puts the default route first *within* that.
+///
+/// A VPN hands out a /32 on a tunnel interface and takes over the default
+/// route, so asking the routing table alone yields an address that no peer on
+/// the LAN can reach and a broadcast that vanishes into the tunnel. Since the
+/// first address is what a peer announces as its own, that address has to be
+/// one others can actually send to.
+fn prefer_lan_addresses(
+    candidates: &[(Ipv4Addr, bool)],
+    default_route: Option<Ipv4Addr>,
+) -> Vec<Ipv4Addr> {
+    let collect = |wanted: bool| {
+        let mut list: Vec<Ipv4Addr> = candidates
+            .iter()
+            .filter(|(_, has_subnet)| *has_subnet == wanted)
+            .map(|(address, _)| *address)
+            .collect();
+        list.sort_by_key(Ipv4Addr::octets);
+        list.dedup();
+        list
+    };
+
+    let mut ordered: Vec<Ipv4Addr> = collect(true).into_iter().chain(collect(false)).collect();
+
+    // The default route only earns the front spot if it is itself on a subnet;
+    // a tunnel address stays wherever it landed.
+    if let Some(default_ip) = default_route.filter(|ip| usable_discovery_ipv4(*ip)) {
+        let on_subnet = candidates
+            .iter()
+            .any(|(address, has_subnet)| *address == default_ip && *has_subnet);
+        if on_subnet {
+            ordered.retain(|address| *address != default_ip);
+            ordered.insert(0, default_ip);
+        } else if !ordered.contains(&default_ip) {
+            ordered.push(default_ip);
+        }
+    }
+
+    ordered
+}
+
+/// Every usable local IPv4 address, the one peers should reach us on first.
 pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
-    let mut addresses = Vec::new();
+    let mut candidates = Vec::new();
 
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for interface in interfaces {
@@ -95,20 +137,14 @@ pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
                 continue;
             };
             if usable_discovery_ipv4(address.ip) {
-                addresses.push(address.ip);
+                // A /32 is a tunnel endpoint, not a subnet we can broadcast on.
+                let has_subnet = address.netmask != Ipv4Addr::new(255, 255, 255, 255);
+                candidates.push((address.ip, has_subnet));
             }
         }
     }
 
-    if let Some(default_ip) = default_route_ipv4_address() {
-        if usable_discovery_ipv4(default_ip) {
-            addresses.insert(0, default_ip);
-        }
-    }
-
-    addresses.sort_by_key(|address| address.octets());
-    addresses.dedup();
-    addresses
+    prefer_lan_addresses(&candidates, default_route_ipv4_address())
 }
 
 /// Broadcast destinations for discovery, fanned out across the discovery port
@@ -201,6 +237,30 @@ pub fn local_peer_id(host: &str, ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vpn_tunnel_never_becomes_the_address_we_advertise() {
+        // Exactly the observed setup: ProtonVPN hands out 10.2.0.2/32 and owns
+        // the default route, while the reachable address is on Wi-Fi. Announcing
+        // the tunnel made the phone unreachable for the desktop.
+        let lan = Ipv4Addr::new(192, 168, 1, 124);
+        let tunnel = Ipv4Addr::new(10, 2, 0, 2);
+        let ordered = prefer_lan_addresses(&[(tunnel, false), (lan, true)], Some(tunnel));
+
+        assert_eq!(ordered.first(), Some(&lan));
+        // The tunnel is still worth announcing on, just never first.
+        assert!(ordered.contains(&tunnel));
+    }
+
+    #[test]
+    fn the_default_route_still_wins_when_it_is_a_normal_interface() {
+        let wired = Ipv4Addr::new(192, 168, 0, 10);
+        let wireless = Ipv4Addr::new(192, 168, 1, 124);
+        let ordered =
+            prefer_lan_addresses(&[(wireless, true), (wired, true)], Some(wireless));
+
+        assert_eq!(ordered, vec![wireless, wired]);
+    }
 
     #[test]
     fn peer_id_matches_the_shape_every_client_must_produce() {
