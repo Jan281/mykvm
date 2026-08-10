@@ -47,7 +47,7 @@ pub struct BarrierSpec {
 
 /// Input arriving from the compositor while capture is active, already
 /// translated out of evdev into the codes MyKVM puts on the wire.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CaptureEvent {
     /// A barrier was crossed. `x`/`y` is the cursor position in compositor
     /// coordinates at the moment of capture.
@@ -229,6 +229,108 @@ pub fn evdev_to_windows_vk(code: u32) -> Option<u16> {
 /// positive as scrolling *down*, Windows as scrolling *up*.
 fn discrete_to_notches(discrete: i32) -> i32 {
     discrete / 120
+}
+
+/// Logical pixels libinput reports per wheel notch. Also the step size a
+/// touchpad's smooth scrolling gets quantised to, since the wire format only
+/// carries whole notches.
+const SCROLL_PIXELS_PER_NOTCH: f32 = 15.0;
+
+/// Turns libei's two scroll axes into whole notches.
+///
+/// A wheel click arrives twice in the same frame: once as [`EiEvent::ScrollDelta`]
+/// in pixels and once as [`EiEvent::ScrollDiscrete`] in 120ths. Emitting both
+/// would scroll twice as far, so a delta is held back until the next event
+/// proves no discrete counterpart is coming — frames share a timestamp, so an
+/// equal `time` identifies the counterpart.
+///
+/// Touchpads send only deltas, which is why handling the discrete kind alone
+/// left smooth scrolling dead on the remote machine.
+#[derive(Default)]
+struct ScrollState {
+    pending: Option<(u64, f32, f32)>,
+    residue_x: f32,
+    residue_y: f32,
+    residue_v120_x: i32,
+    residue_v120_y: i32,
+    logged_source: bool,
+}
+
+impl ScrollState {
+    fn delta(&mut self, time: u64, dx: f32, dy: f32) -> Option<CaptureEvent> {
+        self.log_source("smooth (pixel)");
+        if let Some(slot) = self.pending.as_mut() {
+            if slot.0 == time {
+                // Same frame, so merge rather than flush.
+                slot.1 += dx;
+                slot.2 += dy;
+                return None;
+            }
+        }
+        let flushed = self.flush();
+        self.pending = Some((time, dx, dy));
+        flushed
+    }
+
+    /// `dx`/`dy` are in 120ths of a notch. A high-resolution wheel reports a
+    /// single detent as several sub-120 steps, so these accumulate rather than
+    /// divide-and-drop — plain `dx / 120` rounds every one of those steps to
+    /// zero, which silently kills scrolling on such a mouse entirely.
+    fn discrete(&mut self, time: u64, dx: i32, dy: i32) -> Option<CaptureEvent> {
+        self.log_source("discrete");
+        if matches!(self.pending, Some((pending_time, ..)) if pending_time == time) {
+            self.pending = None;
+        }
+        self.residue_v120_x += dx;
+        self.residue_v120_y += dy;
+        let notches_x = discrete_to_notches(self.residue_v120_x);
+        let notches_y = discrete_to_notches(self.residue_v120_y);
+        self.residue_v120_x -= notches_x * 120;
+        self.residue_v120_y -= notches_y * 120;
+        let delta_x = notches_x;
+        let delta_y = -notches_y;
+        if delta_x == 0 && delta_y == 0 {
+            return None;
+        }
+        Some(CaptureEvent::Scroll { delta_x, delta_y })
+    }
+
+    /// Says once which of the two scroll kinds the compositor actually feeds us.
+    /// Logged on arrival rather than on send, so that "scrolling does nothing"
+    /// can be told apart from "scrolling never arrived" even when the events
+    /// arrive but add up to less than a whole notch.
+    fn log_source(&mut self, source: &str) {
+        if !self.logged_source {
+            log::info!("[wayland] scroll arrives as {source} events");
+            self.logged_source = true;
+        }
+    }
+
+    /// Emits whatever whole notches the buffered pixels add up to, carrying the
+    /// remainder so a slow touchpad drag still scrolls eventually.
+    fn flush(&mut self) -> Option<CaptureEvent> {
+        let (_, dx, dy) = self.pending.take()?;
+        self.residue_x += dx;
+        self.residue_y += dy;
+        let notches_x = (self.residue_x / SCROLL_PIXELS_PER_NOTCH).trunc();
+        let notches_y = (self.residue_y / SCROLL_PIXELS_PER_NOTCH).trunc();
+        self.residue_x -= notches_x * SCROLL_PIXELS_PER_NOTCH;
+        self.residue_y -= notches_y * SCROLL_PIXELS_PER_NOTCH;
+        let delta_x = notches_x as i32;
+        let delta_y = -(notches_y as i32);
+        if delta_x == 0 && delta_y == 0 {
+            return None;
+        }
+        Some(CaptureEvent::Scroll { delta_x, delta_y })
+    }
+
+    /// The gesture ended; nothing more will arrive to flush the tail.
+    fn stop(&mut self) -> Option<CaptureEvent> {
+        let flushed = self.flush();
+        self.residue_x = 0.0;
+        self.residue_y = 0.0;
+        flushed
+    }
 }
 
 /// The one portal session for this process.
@@ -449,6 +551,7 @@ async fn service_loop(
     // Origin for absolute pointer streams; reset per activation so a new
     // hand-over does not inherit the previous one's coordinates.
     let mut last_absolute: Option<(f64, f64)> = None;
+    let mut scroll = ScrollState::default();
     let mut logged_motion_kind = false;
 
     loop {
@@ -521,6 +624,34 @@ async fn service_loop(
                     log::debug!("[wayland] ei lifecycle event: {ei_event:?}");
                 }
 
+                if let EiEvent::DeviceAdded(added) = &ei_event {
+                    // Which interfaces the compositor actually put on the device
+                    // decides what it will ever send us. A pointer without
+                    // ei_scroll can never produce a scroll event, no matter what
+                    // we bound on the seat.
+                    let mut capabilities: Vec<&str> = Vec::new();
+                    if added.device.interface::<ei::Pointer>().is_some() {
+                        capabilities.push("pointer");
+                    }
+                    if added.device.interface::<ei::PointerAbsolute>().is_some() {
+                        capabilities.push("pointer-absolute");
+                    }
+                    if added.device.interface::<ei::Button>().is_some() {
+                        capabilities.push("button");
+                    }
+                    if added.device.interface::<ei::Scroll>().is_some() {
+                        capabilities.push("scroll");
+                    }
+                    if added.device.interface::<ei::Keyboard>().is_some() {
+                        capabilities.push("keyboard");
+                    }
+                    log::info!(
+                        "[wayland] device {:?} offers [{}]",
+                        added.device.name().unwrap_or("<unnamed>"),
+                        capabilities.join(", ")
+                    );
+                }
+
                 if let EiEvent::SeatAdded(seat_event) = &ei_event {
                     seat_event.seat.bind_capabilities(
                         DeviceCapability::Pointer
@@ -547,7 +678,7 @@ async fn service_loop(
                     }
                 }
 
-                let Some(event) = translate_ei_event(ei_event, &mut last_absolute) else { continue };
+                let Some(event) = translate_ei_event(ei_event, &mut last_absolute, &mut scroll) else { continue };
                 let is_deactivation = matches!(event, CaptureEvent::Deactivated);
                 let reaction = dispatch(&handler, event);
 
@@ -673,6 +804,7 @@ fn dispatch(handler: &Arc<Mutex<Option<EventHandler>>>, event: CaptureEvent) -> 
 fn translate_ei_event(
     event: EiEvent,
     last_absolute: &mut Option<(f64, f64)>,
+    scroll: &mut ScrollState,
 ) -> Option<CaptureEvent> {
     match event {
         EiEvent::PointerMotion(motion) => Some(CaptureEvent::Motion {
@@ -696,14 +828,14 @@ fn translate_ei_event(
                 down: matches!(button.state, ei::button::ButtonState::Press),
             })
         }
-        EiEvent::ScrollDiscrete(scroll) => {
-            let delta_x = discrete_to_notches(scroll.discrete_dx);
-            let delta_y = -discrete_to_notches(scroll.discrete_dy);
-            if delta_x == 0 && delta_y == 0 {
-                return None;
-            }
-            Some(CaptureEvent::Scroll { delta_x, delta_y })
+        EiEvent::ScrollDiscrete(event) => {
+            scroll.discrete(event.time, event.discrete_dx, event.discrete_dy)
         }
+        EiEvent::ScrollDelta(event) => scroll.delta(event.time, event.dx, event.dy),
+        // A frame closes the group a held-back delta was waiting on, and a
+        // stop/cancel ends the gesture entirely.
+        EiEvent::Frame(_) => scroll.flush(),
+        EiEvent::ScrollStop(_) | EiEvent::ScrollCancel(_) => scroll.stop(),
         EiEvent::KeyboardKey(key) => {
             let vk = evdev_to_windows_vk(key.key)?;
             Some(CaptureEvent::Key {
@@ -712,7 +844,10 @@ fn translate_ei_event(
             })
         }
         EiEvent::DevicePaused(_) | EiEvent::Disconnected(_) => Some(CaptureEvent::Deactivated),
-        _ => None,
+        other => {
+            log::debug!("[wayland] unhandled ei event: {other:?}");
+            None
+        }
     }
 }
 
@@ -754,5 +889,104 @@ mod tests {
         assert_eq!(discrete_to_notches(120), 1);
         assert_eq!(discrete_to_notches(-240), -2);
         assert_eq!(discrete_to_notches(60), 0);
+    }
+
+    #[test]
+    fn a_wheel_click_scrolls_once_even_though_it_arrives_twice() {
+        let mut scroll = ScrollState::default();
+        // One frame: pixels first, then the discrete counterpart, then the frame.
+        assert_eq!(scroll.delta(100, 0.0, 15.0), None);
+        assert_eq!(
+            scroll.discrete(100, 0, 120),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: -1
+            })
+        );
+        assert_eq!(scroll.flush(), None);
+    }
+
+    #[test]
+    fn a_high_resolution_wheel_scrolls_instead_of_being_rounded_to_nothing() {
+        let mut scroll = ScrollState::default();
+        // A G502-class wheel splits one detent into four 30/120 steps.
+        for frame in 0..3u64 {
+            assert_eq!(scroll.discrete(frame, 0, 30), None);
+        }
+        assert_eq!(
+            scroll.discrete(3, 0, 30),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: -1
+            })
+        );
+    }
+
+    #[test]
+    fn high_resolution_remainders_do_not_leak_across_a_reversal() {
+        let mut scroll = ScrollState::default();
+        assert_eq!(scroll.discrete(0, 0, 60), None);
+        // Turning back the other way cancels the half notch rather than adding
+        // to it, so the wheel does not drift.
+        assert_eq!(scroll.discrete(1, 0, -60), None);
+        assert_eq!(
+            scroll.discrete(2, 0, -120),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: 1
+            })
+        );
+    }
+
+    #[test]
+    fn smooth_scroll_without_a_discrete_counterpart_still_gets_through() {
+        let mut scroll = ScrollState::default();
+        assert_eq!(scroll.delta(100, 0.0, -15.0), None);
+        // The next frame flushes the one before it.
+        assert_eq!(
+            scroll.delta(200, 0.0, -15.0),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: 1
+            })
+        );
+        assert_eq!(
+            scroll.stop(),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: 1
+            })
+        );
+    }
+
+    #[test]
+    fn slow_smooth_scrolling_accumulates_instead_of_being_rounded_away() {
+        let mut scroll = ScrollState::default();
+        // Five pixels per frame, and each frame flushes the one before it: the
+        // first three carry too little to report, the fourth releases a notch.
+        for frame in 0..3u64 {
+            assert_eq!(scroll.delta(frame, 0.0, 5.0), None);
+        }
+        assert_eq!(
+            scroll.delta(3, 0.0, 5.0),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: -1
+            })
+        );
+    }
+
+    #[test]
+    fn deltas_within_one_frame_are_merged_rather_than_sent_twice() {
+        let mut scroll = ScrollState::default();
+        assert_eq!(scroll.delta(100, 0.0, 8.0), None);
+        assert_eq!(scroll.delta(100, 0.0, 8.0), None);
+        assert_eq!(
+            scroll.flush(),
+            Some(CaptureEvent::Scroll {
+                delta_x: 0,
+                delta_y: -1
+            })
+        );
     }
 }
