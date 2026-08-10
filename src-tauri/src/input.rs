@@ -331,54 +331,7 @@ pub struct ClipboardTarget {
     pub expires_at: Option<Instant>,
 }
 
-fn str_ref_is_empty(value: &&str) -> bool {
-    value.is_empty()
-}
-
-/// Borrowing serialization mirror of [`InputPacket`]: identical named
-/// MessagePack bytes when every field is populated (guarded by a test), but
-/// building one clones none of the ~0.8KB of credential strings — send_packet
-/// runs per mouse event. The credential fields are also skipped when empty, so
-/// steady-state packets (which omit them — see send_packet) drop ~0.5KB of the
-/// static pairing block, mostly the base64 transport certificate.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InputPacketRef<'a> {
-    protocol: &'a str,
-    target_device_id: &'a str,
-    #[serde(skip_serializing_if = "str_ref_is_empty")]
-    origin_device_id: &'a str,
-    origin_port: u16,
-    #[serde(skip_serializing_if = "str_ref_is_empty")]
-    origin_transport_public_key: &'a str,
-    origin_protocol_version: u16,
-    #[serde(skip_serializing_if = "str_ref_is_empty")]
-    cluster_id: &'a str,
-    #[serde(skip_serializing_if = "str_ref_is_empty")]
-    pair_secret: &'a str,
-    event: &'a InputEvent,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InputPacket {
-    protocol: String,
-    #[serde(default)]
-    target_device_id: String,
-    #[serde(default)]
-    origin_device_id: String,
-    #[serde(default)]
-    origin_port: u16,
-    #[serde(default)]
-    origin_transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
-    origin_protocol_version: u16,
-    #[serde(default)]
-    cluster_id: String,
-    #[serde(default)]
-    pair_secret: String,
-    event: InputEvent,
-}
+use mykvm_protocol::packet::{InputPacket, InputPacketRef};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

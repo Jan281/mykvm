@@ -27,15 +27,22 @@ mod input;
 #[cfg(target_os = "linux")]
 pub mod linux_input;
 mod performance;
-mod quic_transport;
-pub mod shared_input;
+// The wire format and the transport now live in the `mykvm-protocol` crate so
+// the Android client can share them. Re-exported under their old names to keep
+// every call site — and the input-helper crate, which reaches in through
+// `mykvm_lib::shared_input` — working unchanged.
+pub use mykvm_protocol::input as shared_input;
+pub use mykvm_protocol::transport as quic_transport;
+use mykvm_protocol::discovery::{
+    default_protocol_version, default_transport_port, DiscoveryPacket, LanPeer, LanPeerScreen,
+    DISCOVERY_PROTOCOL,
+};
 #[cfg(target_os = "windows")]
 pub mod windows_input;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
 
-const DISCOVERY_PORT: u16 = 47833;
 const TRANSPORT_PORT_MIN: u16 = 1024;
 const TRANSPORT_PORT_MAX: u16 = 65_535;
 // A peer that wanted the discovery port but found it taken drifts upward (see
@@ -45,7 +52,6 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
-const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.
 const PEER_TTL_MS: u64 = 90_000;
@@ -322,52 +328,6 @@ struct PairedController {
 struct NativeStageStatus {
     state: String,
     detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LanPeer {
-    id: String,
-    name: String,
-    platform: String,
-    #[serde(default)]
-    machine_role: String,
-    #[serde(default)]
-    cluster_id: String,
-    #[serde(default)]
-    pairing_required: bool,
-    host: String,
-    ip: String,
-    #[serde(default = "default_transport_port")]
-    transport_port: u16,
-    #[serde(default)]
-    quic_port: u16,
-    #[serde(default)]
-    transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
-    protocol_version: u16,
-    screen_count: usize,
-    #[serde(default)]
-    input_ready: bool,
-    #[serde(default)]
-    upgrading: bool,
-    #[serde(default)]
-    screens: Vec<LanPeerScreen>,
-    app_version: String,
-    last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LanPeerScreen {
-    id: String,
-    name: String,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    scale: f64,
-    is_primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4465,13 +4425,6 @@ fn normalize_modifier_map(map: &ModifierMap) -> ModifierMap {
     }
 }
 
-fn default_transport_port() -> u16 {
-    DISCOVERY_PORT
-}
-
-fn default_protocol_version() -> u16 {
-    quic_transport::PROTOCOL_VERSION
-}
 
 fn preferred_quic_port(discovery_port: u16) -> u16 {
     discovery_port
@@ -6042,22 +5995,6 @@ fn normalize_peer_platform(platform: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoveryPacket {
-    protocol: String,
-    kind: String,
-    peer: LanPeer,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pairing_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pair_cluster_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pair_secret: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pairing_error: Option<String>,
-}
-
 #[derive(Default)]
 struct DiscoveryPairingFields {
     code: Option<String>,
@@ -7129,6 +7066,9 @@ fn random_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still name the default port directly; the production code
+    // reads it out of the layout.
+    use mykvm_protocol::discovery::DISCOVERY_PORT;
 
     fn test_screen(device_id: &str) -> Screen {
         Screen {

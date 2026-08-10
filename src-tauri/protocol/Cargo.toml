@@ -1,0 +1,22 @@
+[package]
+name = "mykvm-protocol"
+version = "0.1.0"
+description = "The MyKVM wire format and QUIC transport, shared by every client"
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+# Deliberately free of Tauri, of any GUI dependency and of platform input code:
+# this crate is compiled for Android as well, where none of that exists. Keep it
+# that way — anything that only the desktop app needs belongs in `mykvm` instead.
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+rmp-serde = "1"
+log = "0.4"
+base64 = "0.22"
+ring = "0.17.14"
+quinn = "0.11"
+rcgen = "0.13"
+socket2 = "0.6"
+tokio = { version = "1.52", features = ["rt-multi-thread", "io-util", "sync", "time", "macros"] }

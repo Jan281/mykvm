@@ -30,7 +30,7 @@ const SERVER_NAME: &str = "mykvm.local";
 const MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 // Clipboard images are sent as RGBA base64 over streams. The clipboard module
 // caps decoded images at 32 MiB, which becomes roughly 43 MiB on the wire.
-pub(crate) const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
+pub const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
 const PORT_SCAN_COUNT: u16 = 64;
 const QUIC_WORKER_THREADS: usize = 2;
 // Datagram-health fast-fail (concept adopted from PR #22): after this many
