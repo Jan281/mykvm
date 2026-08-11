@@ -201,6 +201,30 @@ fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<Strin
     targets
 }
 
+/// How long a displayed pairing code stays valid.
+pub const PAIRING_CODE_TTL_MS: u64 = 60_000;
+/// Wrong codes tolerated before the challenge is thrown away.
+pub const PAIRING_MAX_ATTEMPTS: u8 = 5;
+
+/// A six-digit pairing code.
+///
+/// Shared so that every client shows a code of the same shape — the server
+/// compares the typed string verbatim, so "0042" and "000042" are not the same
+/// thing.
+pub fn random_pairing_code() -> String {
+    use ring::rand::SecureRandom;
+
+    let mut bytes = [0_u8; 4];
+    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+        let fallback = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        bytes = fallback.to_le_bytes()[..4].try_into().unwrap_or([0; 4]);
+    }
+    format!("{:06}", u32::from_le_bytes(bytes) % 1_000_000)
+}
+
 /// Folds any label into the id alphabet: lowercase ASCII alphanumerics, every
 /// other character becoming a separator.
 pub fn sanitize_id(value: &str) -> String {

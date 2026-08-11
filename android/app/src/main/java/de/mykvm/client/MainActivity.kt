@@ -86,10 +86,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         events = CoreEvents { kind, p1, p2 -> onInput(kind, p1, p2) }.also { it.start() }
-        showStatus()
+        status.post(refresh)
     }
 
     private fun stopCore() {
+        status.removeCallbacks(refresh)
         events?.stop()
         events = null
         NativeCore.nativeStop()
@@ -99,8 +100,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showStatus() {
+        val code = NativeCore.nativePairingCode()
+        val pairing = if (code.isEmpty()) null else "Pairing code: $code"
         val warning = warnIfTunnelled()
-        status.text = listOfNotNull(NativeCore.nativeStatus(), warning).joinToString("\n\n")
+        status.text = listOfNotNull(pairing, NativeCore.nativeStatus(), warning)
+            .joinToString("\n\n")
+    }
+
+    /**
+     * Keeps the screen current while the core runs.
+     *
+     * The pairing code appears when the desktop asks for it and expires on its
+     * own, so it has to show up without the user tapping anything — they are
+     * looking at the desktop at that moment, not at the phone.
+     */
+    private val refresh = object : Runnable {
+        override fun run() {
+            showStatus()
+            if (events != null) status.postDelayed(this, 1000)
+        }
     }
 
     private fun onInput(kind: Int, p1: Int, p2: Int) {

@@ -36,7 +36,8 @@ pub use mykvm_protocol::transport as quic_transport;
 use mykvm_protocol::discovery::{
     broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
     normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
-    local_peer_id, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen, DISCOVERY_PROTOCOL,
+    local_peer_id, random_pairing_code, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen,
+    DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     TRANSPORT_PORT_MAX,
 };
 #[cfg(target_os = "windows")]
@@ -51,8 +52,6 @@ const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
 // short announce gaps so online clients do not flicker offline in the UI.
 const PEER_TTL_MS: u64 = 90_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
-const PAIRING_CODE_TTL_MS: u64 = 60_000;
-const PAIRING_MAX_ATTEMPTS: u8 = 5;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // After we write clipboard content received from a peer, ignore our own
 // clipboard for a short grace window. Reading an image back through the OS
@@ -6874,15 +6873,6 @@ fn random_hex(byte_count: usize) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
-}
-
-fn random_pairing_code() -> String {
-    let rng = SystemRandom::new();
-    let mut bytes = [0_u8; 4];
-    if rng.fill(&mut bytes).is_err() {
-        bytes = now_ms().to_le_bytes()[..4].try_into().unwrap_or([0; 4]);
-    }
-    format!("{:06}", u32::from_le_bytes(bytes) % 1_000_000)
 }
 
 #[cfg(test)]

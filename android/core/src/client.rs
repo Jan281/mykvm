@@ -7,7 +7,7 @@
 
 use std::{
     net::{SocketAddr, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -20,7 +20,8 @@ use std::{
 use mykvm_protocol::{
     discovery::{
         broadcast_addrs, discovery_target_ports, local_ipv4_addresses, local_peer_id,
-        preferred_quic_port, DiscoveryPacket, LanPeer, LanPeerScreen, DISCOVERY_PROTOCOL,
+        preferred_quic_port, random_pairing_code, DiscoveryPacket, LanPeer, LanPeerScreen,
+        DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     },
     input::InputEvent,
     packet::{InputPacket, INPUT_PROTOCOL},
@@ -36,6 +37,53 @@ const DISCOVERY_POLL: Duration = Duration::from_millis(500);
 /// Dropped rather than queued once the consumer falls this far behind. A phone
 /// that cannot keep up should lag, not accumulate minutes of stale motion.
 const MAX_QUEUED_EVENTS: usize = 512;
+
+/// What a completed pairing leaves behind: the cluster we joined and the shared
+/// secret that authorises input packets. Persisted, because losing it would
+/// force the user through pairing again after every restart.
+#[derive(Clone, Default)]
+struct Membership {
+    cluster_id: String,
+    pair_secret: String,
+}
+
+impl Membership {
+    fn is_paired(&self) -> bool {
+        !self.cluster_id.trim().is_empty() && !self.pair_secret.trim().is_empty()
+    }
+
+    /// Two lines of text rather than a serialised struct: this file has to be
+    /// readable when something goes wrong at three in the morning.
+    fn load(dir: &Path) -> Self {
+        let Ok(contents) = std::fs::read_to_string(dir.join(MEMBERSHIP_FILE)) else {
+            return Self::default();
+        };
+        let mut lines = contents.lines();
+        Self {
+            cluster_id: lines.next().unwrap_or_default().trim().to_string(),
+            pair_secret: lines.next().unwrap_or_default().trim().to_string(),
+        }
+    }
+
+    fn save(&self, dir: &Path) -> Result<(), String> {
+        std::fs::write(
+            dir.join(MEMBERSHIP_FILE),
+            format!("{}\n{}\n", self.cluster_id, self.pair_secret),
+        )
+        .map_err(|error| format!("could not persist pairing: {error}"))
+    }
+}
+
+const MEMBERSHIP_FILE: &str = "pairing.txt";
+
+/// An in-flight pairing: the code we are showing and who may answer it.
+struct Challenge {
+    code: String,
+    expires_at: Instant,
+    attempts: u8,
+    requester_id: String,
+    requester_public_key: String,
+}
 
 pub struct Config {
     /// What the user sees in the desktop's device list. Also feeds the peer id.
@@ -57,6 +105,8 @@ pub struct Client {
     device_id: String,
     quic_port: u16,
     peers_seen: Arc<Mutex<Vec<String>>>,
+    challenge: Arc<Mutex<Option<Challenge>>>,
+    membership: Arc<Mutex<Membership>>,
 }
 
 impl Client {
@@ -86,10 +136,22 @@ impl Client {
             .lock()
             .map(|peers| peers.join(", "))
             .unwrap_or_default();
+        let paired = self
+            .membership
+            .lock()
+            .map(|membership| membership.is_paired())
+            .unwrap_or(false);
         format!(
-            "id={} quic={} peers=[{}]",
-            self.device_id, self.quic_port, peers
+            "id={} quic={} paired={} peers=[{}]",
+            self.device_id, self.quic_port, paired, peers
         )
+    }
+
+    /// The code the user has to type on the desktop, while it is valid.
+    pub fn pairing_code(&self) -> Option<String> {
+        let challenge = self.challenge.lock().ok()?;
+        let challenge = challenge.as_ref()?;
+        (challenge.expires_at > Instant::now()).then(|| challenge.code.clone())
     }
 }
 
@@ -103,7 +165,17 @@ pub fn start(config: Config) -> Result<Client, String> {
     let (event_tx, event_rx) = mpsc::channel();
     let queued = Arc::new(Mutex::new(0usize));
 
-    let transport = start_transport(&config, &device_id, event_tx, Arc::clone(&queued))?;
+    let membership = Arc::new(Mutex::new(Membership::load(&config.identity_dir)));
+    let challenge = Arc::new(Mutex::new(None));
+
+    let transport = start_transport(
+        &config,
+        &device_id,
+        event_tx,
+        Arc::clone(&queued),
+        Arc::clone(&challenge),
+        Arc::clone(&membership),
+    )?;
 
     let running = Arc::new(AtomicBool::new(true));
     let peers_seen = Arc::new(Mutex::new(Vec::new()));
@@ -115,6 +187,8 @@ pub fn start(config: Config) -> Result<Client, String> {
         transport.clone(),
         Arc::clone(&running),
         Arc::clone(&peers_seen),
+        Arc::clone(&challenge),
+        Arc::clone(&membership),
     )?;
 
     let quic_port = transport.port();
@@ -127,6 +201,8 @@ pub fn start(config: Config) -> Result<Client, String> {
         device_id,
         quic_port,
         peers_seen,
+        challenge,
+        membership,
     })
 }
 
@@ -137,6 +213,8 @@ fn start_transport(
     device_id: &str,
     events: Sender<InputEvent>,
     queued: Arc<Mutex<usize>>,
+    challenge: Arc<Mutex<Option<Challenge>>>,
+    membership: Arc<Mutex<Membership>>,
 ) -> Result<TransportHandle, String> {
     let expected_target = device_id.to_string();
 
@@ -182,10 +260,27 @@ fn start_transport(
         }
     });
 
-    // A phone neither sends nor answers clipboard and file streams yet.
-    let on_stream = Arc::new(|_payload: Vec<u8>, from: SocketAddr| {
-        log::debug!("[core] ignoring stream from {from}");
-        false
+    // Streams carry clipboard and files, neither of which a phone does yet —
+    // but also the pairing confirmation, which is why this is not a stub. The
+    // returned bool is the acknowledgement the server waits for.
+    let identity_dir = config.identity_dir.clone();
+    let on_stream = Arc::new(move |payload: Vec<u8>, from: SocketAddr| {
+        let Ok(packet) = rmp_serde::from_slice::<DiscoveryPacket>(&payload) else {
+            log::debug!("[core] undecodable stream from {from}");
+            return false;
+        };
+        if packet.protocol != DISCOVERY_PROTOCOL || packet.kind != "pair-confirm" {
+            log::debug!("[core] ignoring {} stream from {from}", packet.kind);
+            return false;
+        }
+
+        match complete_pairing(&challenge, &membership, &identity_dir, &packet) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("[core] pairing rejected: {error}");
+                false
+            }
+        }
     });
 
     transport::start(
@@ -209,6 +304,8 @@ fn spawn_discovery(
     transport: TransportHandle,
     running: Arc<AtomicBool>,
     peers_seen: Arc<Mutex<Vec<String>>>,
+    challenge: Arc<Mutex<Option<Challenge>>>,
+    membership: Arc<Mutex<Membership>>,
 ) -> Result<(), String> {
     let socket = bind_discovery_socket(config.discovery_port)?;
     socket
@@ -229,12 +326,22 @@ fn spawn_discovery(
             let mut buffer = vec![0u8; 64 * 1024];
             let mut last_announce = Instant::now() - ANNOUNCE_INTERVAL;
 
+            // Rebuilt per use rather than cached: pairing changes what we
+            // announce, and a stale peer would keep claiming to need pairing
+            // long after it joined.
+            let current_peer = |membership: &Arc<Mutex<Membership>>| {
+                let joined = membership
+                    .lock()
+                    .map(|membership| membership.clone())
+                    .unwrap_or_default();
+                build_peer(
+                    &device_id, &name, &ip, base_port, &transport, width, height, &joined,
+                )
+            };
+
             while running.load(Ordering::Relaxed) {
                 if last_announce.elapsed() >= ANNOUNCE_INTERVAL {
-                    let peer = build_peer(
-                        &device_id, &name, &ip, base_port, &transport, width, height,
-                    );
-                    broadcast(&socket, &peer, base_port);
+                    broadcast(&socket, &current_peer(&membership), base_port);
                     last_announce = Instant::now();
                 }
 
@@ -259,11 +366,29 @@ fn spawn_discovery(
 
                 remember_peer(&peers_seen, &incoming.peer, from);
 
+                if incoming.kind == "pair-request" {
+                    let paired = membership
+                        .lock()
+                        .map(|membership| membership.is_paired())
+                        .unwrap_or(false);
+                    if begin_challenge(&challenge, &incoming.peer, paired) {
+                        let peer = current_peer(&membership);
+                        let packet = packet_for(&peer, "pair-challenge");
+                        if let Ok(payload) = rmp_serde::to_vec_named(&packet) {
+                            let _ = socket.send_to(&payload, from);
+                        }
+                    }
+                    continue;
+                }
+
                 if matches!(incoming.kind.as_str(), "announce" | "probe") {
-                    let peer = build_peer(
-                        &device_id, &name, &ip, base_port, &transport, width, height,
+                    reply(
+                        &socket,
+                        &current_peer(&membership),
+                        from,
+                        &incoming.peer.ip,
+                        base_port,
                     );
-                    reply(&socket, &peer, from, &incoming.peer.ip, base_port);
                 }
             }
 
@@ -302,18 +427,19 @@ fn build_peer(
     transport: &TransportHandle,
     width: i32,
     height: i32,
+    membership: &Membership,
 ) -> LanPeer {
     LanPeer {
         id: device_id.to_string(),
         name: name.to_string(),
         platform: "android".into(),
         machine_role: "client".into(),
-        cluster_id: String::new(),
+        cluster_id: membership.cluster_id.clone(),
         // Until we have joined a cluster we must announce ourselves as needing
         // to pair. A server accepts an unknown peer on exactly that condition
         // (`peer_visible_to_layout`); claiming to be configured while carrying
         // no cluster id makes it drop us without a word.
-        pairing_required: true,
+        pairing_required: !membership.is_paired(),
         host: name.to_string(),
         ip: ip.to_string(),
         transport_port: base_port,
@@ -461,6 +587,102 @@ fn remember_peer(peers: &Arc<Mutex<Vec<String>>>, peer: &LanPeer, from: SocketAd
         }
         peers.push(label);
     }
+}
+
+/// Answers a `pair-request` by showing a code and replying with our peer.
+///
+/// The server drives pairing: it asks, we show a code, the user types it there,
+/// and it comes back over an encrypted stream. Only a server may ask, and only
+/// while we have not joined a cluster yet.
+fn begin_challenge(challenge: &Arc<Mutex<Option<Challenge>>>, requester: &LanPeer, paired: bool) -> bool {
+    if requester.machine_role != "server" || paired {
+        return false;
+    }
+
+    let Ok(mut slot) = challenge.lock() else {
+        return false;
+    };
+
+    // A repeated request from the same server keeps the code on screen, so the
+    // user is not chasing a number that changes while they type it.
+    if let Some(existing) = slot.as_mut() {
+        if existing.expires_at > Instant::now()
+            && existing.requester_id == requester.id
+            && existing.attempts == 0
+        {
+            existing.requester_public_key = requester.transport_public_key.clone();
+            return true;
+        }
+    }
+
+    let code = random_pairing_code();
+    log::info!("[core] pairing code {code} for {}", requester.name);
+    *slot = Some(Challenge {
+        code,
+        expires_at: Instant::now() + Duration::from_millis(PAIRING_CODE_TTL_MS),
+        attempts: 0,
+        requester_id: requester.id.clone(),
+        requester_public_key: requester.transport_public_key.clone(),
+    });
+    true
+}
+
+/// Verifies a `pair-confirm` and, if it holds up, joins the cluster.
+///
+/// Mirrors the server's own checks: the code must match, it must come from the
+/// peer we issued it to, and a handful of wrong guesses throws the challenge
+/// away rather than allowing an endless hunt for six digits.
+fn complete_pairing(
+    challenge: &Arc<Mutex<Option<Challenge>>>,
+    membership: &Arc<Mutex<Membership>>,
+    identity_dir: &Path,
+    packet: &DiscoveryPacket,
+) -> Result<(), String> {
+    let code = packet.pairing_code.clone().unwrap_or_default();
+    let cluster_id = packet.pair_cluster_id.clone().unwrap_or_default();
+    let secret = packet.pair_secret.clone().unwrap_or_default();
+    if code.trim().is_empty() || cluster_id.trim().is_empty() || secret.trim().is_empty() {
+        return Err("confirmation is missing its code or cluster".into());
+    }
+
+    {
+        let mut slot = challenge
+            .lock()
+            .map_err(|_| "pairing lock poisoned".to_string())?;
+        let Some(existing) = slot.as_mut() else {
+            return Err("no pairing is in progress".into());
+        };
+        if existing.expires_at <= Instant::now() {
+            *slot = None;
+            return Err("the code expired".into());
+        }
+        if existing.requester_id != packet.peer.id
+            || (!existing.requester_public_key.trim().is_empty()
+                && existing.requester_public_key != packet.peer.transport_public_key)
+        {
+            return Err("confirmation came from a different peer".into());
+        }
+        if existing.code != code.trim() {
+            existing.attempts = existing.attempts.saturating_add(1);
+            if existing.attempts >= PAIRING_MAX_ATTEMPTS {
+                *slot = None;
+            }
+            return Err("wrong code".into());
+        }
+        *slot = None;
+    }
+
+    let joined = Membership {
+        cluster_id: cluster_id.trim().into(),
+        pair_secret: secret.trim().into(),
+    };
+    joined.save(identity_dir)?;
+    *membership
+        .lock()
+        .map_err(|_| "membership lock poisoned".to_string())? = joined;
+
+    log::info!("[core] paired with {} ({})", packet.peer.name, cluster_id.trim());
+    Ok(())
 }
 
 fn now_ms() -> u64 {

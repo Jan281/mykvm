@@ -28,6 +28,9 @@ object NativeCore {
     /** One line: our id, our QUIC port, and the peers we have heard from. */
     external fun nativeStatus(): String
 
+    /** The code to type on the desktop, or empty while none is pending. */
+    external fun nativePairingCode(): String
+
     const val KIND_MOUSE_MOVE = 1
     const val KIND_MOUSE_BUTTON = 2
     const val KIND_SCROLL = 3

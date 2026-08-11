@@ -128,6 +128,22 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStop(
     }
 }
 
+/// The pairing code to type on the desktop, or an empty string when none is
+/// pending. Polled by the UI rather than pushed, so the code appearing needs no
+/// callback into the JVM.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePairingCode(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let code = CLIENT
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|running| running.pairing_code()))
+        .unwrap_or_default();
+    to_java_string(&env, &code)
+}
+
 /// A one-line summary for the setup screen: our id, our QUIC port and which
 /// peers we have heard from.
 #[no_mangle]
