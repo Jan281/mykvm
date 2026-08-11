@@ -1090,10 +1090,17 @@ function App() {
         return current;
       }
 
-      const nextPosition = snapScreenPosition(current.layout, dragState.screenId, {
+      const wanted = {
         x: dragState.startX + deltaX,
         y: dragState.startY + deltaY,
-      });
+      };
+      // Alt places a device exactly where it is dropped. Snapping pulls a
+      // screen onto a neighbour's line from a good distance away, which is what
+      // you want almost always — and exactly what you cannot fight when the
+      // place you mean lies just inside that pull.
+      const nextPosition = event.altKey
+        ? wanted
+        : snapScreenPosition(current.layout, dragState.screenId, wanted);
 
       return {
         ...current,
@@ -2817,7 +2824,7 @@ function App() {
               <div className="edge-editor-bar">
                 <p className="edge-editor-hint">
                   {selectedScreen
-                    ? `${ui.layout.boardScale}: ${selectedScreen.name}`
+                    ? `${ui.layout.boardScale}: ${selectedScreen.name} — ${ui.layout.dragHint}`
                     : ui.layout.reloadScreensHint}
                 </p>
                 <div className="edge-editor-actions">

@@ -184,6 +184,7 @@ export const TEXT = {
       reloadScreensHint: "屏幕位置由各自的操作系统决定。在系统显示设置中调整后，用这里重新读取。",
       boardScale: "显示大小",
       boardScaleHint: "只改变布局中的绘制大小，不影响分辨率或跨越行为。",
+      dragHint: "拖动可移动整台设备。按住 Alt 可忽略吸附。",
       edgesClear: "全部清除",
       edgesPending: "已选择：",
       edgesUnlinked: "未连接",
@@ -444,6 +445,7 @@ export const TEXT = {
       boardScale: "Drawn size",
       boardScaleHint:
         "Changes how large this screen is drawn, nothing else. Resolution and crossings are unaffected.",
+      dragHint: "Dragging moves the whole machine. Hold Alt to ignore snapping.",
       edgesClear: "Clear all",
       edgesPending: "Selected:",
       edgesUnlinked: "Not linked",
@@ -707,6 +709,7 @@ export const TEXT = {
       boardScale: "Darstellungsgröße",
       boardScaleHint:
         "Ändert nur, wie groß dieser Bildschirm gezeichnet wird. Auflösung und Übertritte bleiben unberührt.",
+      dragHint: "Ziehen bewegt das ganze Gerät. Alt gedrückt halten, um das Einrasten zu übergehen.",
       edgesClear: "Alle entfernen",
       edgesPending: "Ausgewählt:",
       edgesUnlinked: "Nicht verbunden",
