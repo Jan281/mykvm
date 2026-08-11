@@ -368,6 +368,7 @@ dependencies = [
  "log",
  "mykvm-protocol",
  "rmp-serde",
+ "serde",
  "socket2",
 ]
 

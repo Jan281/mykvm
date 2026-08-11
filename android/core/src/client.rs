@@ -76,6 +76,34 @@ impl Membership {
 
 const MEMBERSHIP_FILE: &str = "pairing.txt";
 
+/// Just enough of any stream to tell what it is.
+///
+/// The kinds differ in shape — a discovery packet carries a whole peer, a
+/// clipboard packet does not — so identifying one before decoding it keeps
+/// valid traffic from being written off as corrupt.
+#[derive(serde::Deserialize)]
+struct StreamProbe {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// Names an unsupported stream kind once, rather than on every arrival.
+fn log_unsupported_stream(protocol: &str) {
+    use std::sync::Mutex as StdMutex;
+    static SEEN: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+    let Ok(mut seen) = SEEN.lock() else {
+        return;
+    };
+    if seen.iter().any(|known| known == protocol) {
+        return;
+    }
+    log::info!("[core] acknowledging {protocol} streams, but nothing acts on them yet");
+    seen.push(protocol.to_string());
+}
+
 /// An in-flight pairing: the code we are showing and who may answer it.
 struct Challenge {
     code: String,
@@ -270,22 +298,34 @@ fn start_transport(
     // returned bool is the acknowledgement the server waits for.
     let identity_dir = config.identity_dir.clone();
     let on_stream = Arc::new(move |payload: Vec<u8>, from: SocketAddr| {
-        let Ok(packet) = rmp_serde::from_slice::<DiscoveryPacket>(&payload) else {
+        // Peek at the protocol before committing to a shape: clipboard packets
+        // carry no `peer`, so decoding everything as a DiscoveryPacket would
+        // report perfectly good traffic as garbage.
+        let Ok(probe) = rmp_serde::from_slice::<StreamProbe>(&payload) else {
             log::debug!("[core] undecodable stream from {from}");
             return false;
         };
-        if packet.protocol != DISCOVERY_PROTOCOL || packet.kind != "pair-confirm" {
-            log::debug!("[core] ignoring {} stream from {from}", packet.kind);
-            return false;
+
+        if probe.protocol == DISCOVERY_PROTOCOL && probe.kind == "pair-confirm" {
+            let Ok(packet) = rmp_serde::from_slice::<DiscoveryPacket>(&payload) else {
+                log::warn!("[core] malformed pairing confirmation from {from}");
+                return false;
+            };
+            return match complete_pairing(&challenge, &membership, &identity_dir, &packet) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("[core] pairing rejected: {error}");
+                    false
+                }
+            };
         }
 
-        match complete_pairing(&challenge, &membership, &identity_dir, &packet) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("[core] pairing rejected: {error}");
-                false
-            }
-        }
+        // Everything else is acknowledged rather than refused. A refused stream
+        // makes the sender drop the QUIC connection, and the next input
+        // datagram then pays for re-establishing it — a clipboard we do not
+        // support yet would show up as the cursor stuttering on arrival.
+        log_unsupported_stream(&probe.protocol);
+        true
     });
 
     transport::start(
