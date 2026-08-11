@@ -7,7 +7,11 @@
 
 mod client;
 
-use std::{path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use jni::{
     objects::{JClass, JString},
@@ -19,7 +23,17 @@ use client::Client;
 
 /// The one client per process. Android may recreate the service around it, so
 /// starting twice has to be harmless rather than fatal.
-static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
+///
+/// Behind an `Arc` so that polling can let go of this lock before it blocks.
+/// Holding it across a blocking wait starved every other call — and since the
+/// setup screen asks for status once a second, that showed up as a UI frozen
+/// on its splash.
+static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
+
+/// The running client, if any, without keeping the lock.
+fn current() -> Option<Arc<Client>> {
+    CLIENT.lock().ok()?.as_ref().map(Arc::clone)
+}
 
 fn take_string(env: &mut JNIEnv, value: &JString) -> String {
     env.get_string(value)
@@ -77,7 +91,7 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStart(
 
     match client::start(config) {
         Ok(started) => {
-            *slot = Some(started);
+            *slot = Some(Arc::new(started));
             to_java_string(&env, "")
         }
         Err(error) => {
@@ -95,15 +109,11 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePoll(
     _class: JClass,
     timeout_ms: jint,
 ) -> jintArray {
-    let event = {
-        let Ok(slot) = CLIENT.lock() else {
-            return std::ptr::null_mut();
-        };
-        let Some(running) = slot.as_ref() else {
-            return std::ptr::null_mut();
-        };
-        running.poll(Duration::from_millis(timeout_ms.max(0) as u64))
+    // The clone is the point: the lock is released before the wait begins.
+    let Some(running) = current() else {
+        return std::ptr::null_mut();
     };
+    let event = running.poll(Duration::from_millis(timeout_ms.max(0) as u64));
 
     let Some(event) = event else {
         return std::ptr::null_mut();
@@ -143,10 +153,8 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePairingCode(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let code = CLIENT
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(|running| running.pairing_code()))
+    let code = current()
+        .and_then(|running| running.pairing_code())
         .unwrap_or_default();
     to_java_string(&env, &code)
 }
@@ -158,10 +166,8 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeTakeClipboard(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let text = CLIENT
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(|running| running.take_clipboard()))
+    let text = current()
+        .and_then(|running| running.take_clipboard())
         .unwrap_or_default();
     to_java_string(&env, &text)
 }
@@ -210,10 +216,8 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeKeyboardLayout(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let layout = CLIENT
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().map(|running| running.keyboard_layout()))
+    let layout = current()
+        .map(|running| running.keyboard_layout())
         .unwrap_or_default();
     to_java_string(&env, &layout)
 }
@@ -225,10 +229,8 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStatus(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let text = CLIENT
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().map(|running| running.status()))
+    let text = current()
+        .map(|running| running.status())
         .unwrap_or_else(|| "stopped".into());
     to_java_string(&env, &text)
 }
