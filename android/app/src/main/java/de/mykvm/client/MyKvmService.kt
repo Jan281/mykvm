@@ -29,6 +29,9 @@ class MyKvmService : Service() {
     private var events: CoreEvents? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var cursor: CursorOverlay? = null
+    /** Where the drawn pointer sits — clicks are dispatched here. */
+    private var pointerX = 0
+    private var pointerY = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -92,13 +95,59 @@ class MyKvmService : Service() {
     private fun onInput(kind: Int, p1: Int, p2: Int) {
         when (kind) {
             NativeCore.KIND_MOUSE_MOVE -> {
+                pointerX = p1
+                pointerY = p2
                 cursor?.moveTo(p1, p2)
                 keepCursorVisible()
             }
-            // Clicks and keys land in the next two steps; logging them keeps
-            // the pipeline observable until then.
+
+            NativeCore.KIND_MOUSE_BUTTON -> onButton(button = p1, down = p2 != 0)
+
+            // A wheel notch is positive upwards on the wire, the same
+            // convention the Windows receiver uses.
+            NativeCore.KIND_SCROLL -> reachOrWarn()?.scroll(pointerX, pointerY, p2)
+
+            // Keys are step 8, over the input method.
             else -> Log.i(TAG, "input kind=$kind p1=$p1 p2=$p2")
         }
+    }
+
+    /**
+     * A press only records where it began; the release decides whether that was
+     * a click, a long press or a drag. Middle and side buttons have no meaning
+     * on a touch screen and are dropped rather than mapped to something
+     * arbitrary.
+     */
+    private fun onButton(button: Int, down: Boolean) {
+        val hands = reachOrWarn() ?: return
+        when (button) {
+            BUTTON_LEFT -> if (down) hands.press(pointerX, pointerY)
+                else hands.release(pointerX, pointerY, longPress = false)
+            // Right-click is long-press on Android; that is what opens a
+            // context menu here, so it is a translation rather than a guess.
+            BUTTON_RIGHT -> if (down) hands.press(pointerX, pointerY)
+                else hands.release(pointerX, pointerY, longPress = true)
+            else -> Log.d(TAG, "ignoring button $button")
+        }
+    }
+
+    /**
+     * The accessibility service, or a warning naming why nothing happened —
+     * a click that silently does nothing is the worst possible feedback.
+     */
+    private fun reachOrWarn(): MyKvmAccessibilityService? {
+        val hands = MyKvmAccessibilityService.instance
+        if (hands == null) warnOnce()
+        return hands
+    }
+
+    private var warnedAboutAccessibility = false
+
+    private fun warnOnce() {
+        if (warnedAboutAccessibility) return
+        warnedAboutAccessibility = true
+        Log.w(TAG, "accessibility service is off; clicks and scrolling do nothing")
+        updateNotification(getString(R.string.needs_accessibility))
     }
 
     /**
@@ -198,6 +247,9 @@ class MyKvmService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val DISCOVERY_PORT = 47833
         private const val CURSOR_IDLE_MS = 2000L
+        // Ordinals from the core's flatten(): Left, Right, Middle, Back, Forward.
+        private const val BUTTON_LEFT = 0
+        private const val BUTTON_RIGHT = 1
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, MyKvmService::class.java))

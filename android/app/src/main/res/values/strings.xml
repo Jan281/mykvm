@@ -5,4 +5,6 @@
     <string name="service_starting">Starting…</string>
     <string name="service_failed">Could not start: %1$s</string>
     <string name="action_stop">Stop</string>
+    <string name="needs_accessibility">Enable the accessibility service so clicks work</string>
+    <string name="accessibility_description">Lets MyKVM tap, drag and scroll where the remote pointer is.</string>
 </resources>
