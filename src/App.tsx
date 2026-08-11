@@ -1485,16 +1485,27 @@ function App() {
     return Number.isFinite(value) && value > 0 ? value : 1;
   }
 
+  /**
+   * Scales the whole machine the screen belongs to.
+   *
+   * A device's monitors are one physical cluster; sizing one of them apart from
+   * its siblings would describe a desk nobody has.
+   */
   function setScreenBoardScale(screenId: string, next: number) {
     const clamped = Math.round(Math.min(2, Math.max(0.2, next)) * 100) / 100;
     updateLayout((current) => ({
       ...current,
-      devices: current.devices.map((device) => ({
-        ...device,
-        screens: device.screens.map((screen) =>
-          screen.id === screenId ? { ...screen, boardScale: clamped } : screen,
-        ),
-      })),
+      devices: current.devices.map((device) =>
+        device.screens.some((screen) => screen.id === screenId)
+          ? {
+              ...device,
+              screens: device.screens.map((screen) => ({
+                ...screen,
+                boardScale: clamped,
+              })),
+            }
+          : device,
+      ),
     }));
   }
 
