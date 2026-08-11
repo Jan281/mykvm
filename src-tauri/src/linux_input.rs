@@ -95,12 +95,13 @@ pub struct CaptureReady {
     pub zones: Vec<(i32, i32, u32, u32)>,
 }
 
-/// evdev button codes (`input-event-codes.h`).
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-const BTN_MIDDLE: u32 = 0x112;
-const BTN_SIDE: u32 = 0x113;
-const BTN_EXTRA: u32 = 0x114;
+/// evdev button codes (`input-event-codes.h`). Shared with `linux_inject`,
+/// which needs the same codes to go the other direction.
+pub(crate) const BTN_LEFT: u32 = 0x110;
+pub(crate) const BTN_RIGHT: u32 = 0x111;
+pub(crate) const BTN_MIDDLE: u32 = 0x112;
+pub(crate) const BTN_SIDE: u32 = 0x113;
+pub(crate) const BTN_EXTRA: u32 = 0x114;
 
 fn map_button(code: u32) -> Option<LinuxButton> {
     match code {

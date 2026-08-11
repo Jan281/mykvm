@@ -197,6 +197,41 @@ impl TransportHandle {
             .map_err(|_| "QUIC stream send timed out".to_string())?
     }
 
+    /// Same reliability as `send_stream_expect_ack` — QUIC retransmits within
+    /// an open stream regardless of whether anyone waits for the ack — but
+    /// never blocks the caller. For events fired from a live input-capture
+    /// hot path, where stalling on one slow peer would freeze capture
+    /// entirely, not just this one send. The background command loop already
+    /// logs failures and updates peer health on its own; nothing is lost by
+    /// not waiting for the result here.
+    pub fn send_stream_fire_and_forget(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        if payload.len() > MAX_STREAM_BYTES {
+            return Err(format!(
+                "QUIC stream payload is too large: {} bytes",
+                payload.len()
+            ));
+        }
+        if peer_fast_fail_active(&self.peer_health, &peer.addr) {
+            return Err(format!(
+                "QUIC peer {} unreachable ({DATAGRAM_FAIL_THRESHOLD}+ consecutive failures)",
+                peer.addr
+            ));
+        }
+
+        let (result_tx, _result_rx) = mpsc::channel();
+        self.commands
+            .send(TransportCommand::SendStream {
+                peer,
+                payload,
+                result: result_tx,
+            })
+            .map_err(|_| "QUIC transport is stopped".to_string())
+    }
+
     pub fn shutdown(&self) {
         let _ = self.commands.send(TransportCommand::Shutdown);
     }

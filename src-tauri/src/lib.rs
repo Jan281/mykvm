@@ -26,6 +26,8 @@ mod clipboard;
 mod input;
 #[cfg(target_os = "linux")]
 pub mod linux_input;
+#[cfg(target_os = "linux")]
+pub mod linux_inject;
 mod performance;
 // The wire format and the transport now live in the `mykvm-protocol` crate so
 // the Android client can share them. Re-exported under their old names to keep
@@ -731,6 +733,14 @@ impl AppRuntime {
         let transport_packets_for_stream = Arc::clone(&self.transport_packets);
         let input_events = Arc::clone(&self.input_events);
         let clipboard_packets = Arc::clone(&self.clipboard_packets);
+        // Key events now ride streams (see `send_stream_fire_and_forget`), so
+        // `on_stream` needs its own copies of everything `on_datagram` already
+        // moved in above.
+        let layout_for_input_stream = Arc::clone(&self.layout);
+        let native_layout_for_input_stream = self.native_layout();
+        let input_events_for_stream = Arc::clone(&self.input_events);
+        let clipboard_target_for_stream = Arc::clone(&self.clipboard_target);
+        let input_receive_enabled_for_stream = Arc::clone(&self.input_receive_enabled);
         let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
         let config_path_for_pairing = self.config_path.clone();
         let peers_for_pairing = Arc::clone(&self.peers);
@@ -752,6 +762,26 @@ impl AppRuntime {
         });
 
         let on_stream = Arc::new(move |payload: Vec<u8>, source| {
+            // Key events are the highest-frequency stream traffic once they
+            // ride streams instead of datagrams (see `send_packet`), so they
+            // get first look here — same "hot path decodes first" reasoning
+            // `handle_input_datagram` already documents for the datagram
+            // side. That function only takes transport-agnostic
+            // parameters, so it serves stream-delivered input unchanged.
+            if input_receive_enabled_for_stream.load(Ordering::Relaxed)
+                && input::handle_input_datagram(
+                    &layout_for_input_stream,
+                    &native_layout_for_input_stream,
+                    &payload,
+                    source,
+                    &input_events_for_stream,
+                    &clipboard_target_for_stream,
+                )
+            {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+
             if handle_pairing_stream_packet(
                 &payload,
                 source,

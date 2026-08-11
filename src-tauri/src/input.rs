@@ -853,6 +853,25 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
         };
     }
 
+    // Opening the RemoteDesktop session here — unconditionally, on every
+    // call — is what makes the permission prompt land at startup instead of
+    // whenever a peer happens to start sending input, mirroring why
+    // linux_input's CaptureService is opened just as eagerly.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = crate::linux_inject::service() {
+        return NativeStageStatus {
+            state: "error".into(),
+            detail: error,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(reason) = crate::linux_inject::denial_reason() {
+        return NativeStageStatus {
+            state: "error".into(),
+            detail: reason,
+        };
+    }
+
     NativeStageStatus {
         state: "ready".into(),
         detail: format!(
@@ -2636,7 +2655,18 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
+    // Key events are discrete and non-idempotent — a dropped one is a
+    // permanently lost keystroke, unlike a dropped mouse-move sample (the
+    // next one supersedes it within ~8ms). They go over the reliable stream
+    // path instead. MouseButton/Scroll stay on datagrams: a click's x/y is
+    // position-correlated with the most recent MouseMove, and mixing
+    // substrates would risk the two reordering relative to each other.
+    let send_result = match packet_context.event {
+        InputEvent::Key { .. } => quic_transport.send_stream_fire_and_forget(peer, payload),
+        _ => quic_transport.send_datagram(peer, payload),
+    };
+
+    match send_result {
         Ok(()) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
@@ -2873,8 +2903,10 @@ fn mark_target_offline(
     device.online = false;
 }
 
-/// Handles one received input-plane datagram end to end. Structured for the
-/// per-move cost, not readability of the rare cases:
+/// Handles one received input-plane payload end to end, whether it arrived as
+/// a datagram (mouse/scroll) or a reliable stream (`Key`, see `send_packet`)
+/// — decode/authorize/dispatch don't care which transport carried the bytes.
+/// Structured for the per-move cost, not readability of the rare cases:
 /// - decode runs entirely OUTSIDE the layout lock, and input packets decode
 ///   first (they outnumber control packets by orders of magnitude; the old
 ///   control-first order fully parsed every mouse move against the wrong
@@ -7123,16 +7155,36 @@ fn inject_key(key_code: u16, down: bool) {
     crate::windows_input::inject_key(key_code, down);
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
+    crate::linux_inject::inject_mouse_move(x, y, drag_button);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
+    crate::linux_inject::inject_mouse_button(button, down, x, y);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_scroll(delta_x: i32, delta_y: i32) {
+    crate::linux_inject::inject_scroll(delta_x, delta_y);
+}
+
+#[cfg(target_os = "linux")]
+fn inject_key(key_code: u16, down: bool) {
+    crate::linux_inject::inject_key(key_code, down);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_move(_x: i32, _y: i32, _drag_button: Option<MouseButton>) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_mouse_button(_button: MouseButton, _down: bool, _x: i32, _y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_scroll(_delta_x: i32, _delta_y: i32) {}
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn inject_key(_key_code: u16, _down: bool) {}
 
 #[cfg(test)]
