@@ -18,6 +18,7 @@ use std::{
 };
 
 use mykvm_protocol::{
+    clipboard::{ClipboardPacket, CLIPBOARD_PROTOCOL},
     discovery::{
         broadcast_addrs, discovery_target_ports, local_ipv4_addresses, local_peer_id,
         preferred_quic_port, random_pairing_code, DiscoveryPacket, LanPeer, LanPeerScreen,
@@ -141,6 +142,22 @@ pub struct Client {
     layout: Arc<Mutex<String>>,
     /// Current screen size. Changes when the phone is rotated.
     screen: Arc<Mutex<(i32, i32)>>,
+    clipboard: Arc<Clipboard>,
+}
+
+/// Clipboard state shared between the transport and the JNI layer.
+///
+/// `last_signature` is what stops a copy bouncing: whatever we applied and
+/// whatever we sent are both recorded, so neither comes back around as a fresh
+/// copy a moment later.
+#[derive(Default)]
+struct Clipboard {
+    /// Text received and not yet handed to Kotlin.
+    incoming: Mutex<Option<String>>,
+    last_signature: Mutex<String>,
+    sequence: Mutex<u64>,
+    /// Peers to send our copies to, learned from discovery.
+    peers: Mutex<Vec<(String, String, u16)>>,
 }
 
 impl Client {
@@ -206,6 +223,77 @@ impl Client {
         true
     }
 
+    /// Takes text that arrived from a peer, if any. Kotlin polls this and puts
+    /// it on the system clipboard, which only the active keyboard may do.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.incoming.lock().ok()?.take()
+    }
+
+    /// Sends a copy made on this phone to every known peer.
+    ///
+    /// Returns false when there is nothing to do — not paired, no peers, or the
+    /// same content we just applied from elsewhere.
+    pub fn send_clipboard(&self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+
+        let membership = match self.membership.lock() {
+            Ok(membership) => membership.clone(),
+            Err(_) => return false,
+        };
+        if !membership.is_paired() {
+            return false;
+        }
+
+        let signature = format!("text:{text}");
+        {
+            let Ok(mut last) = self.clipboard.last_signature.lock() else {
+                return false;
+            };
+            if *last == signature {
+                return false;
+            }
+            *last = signature;
+        }
+
+        let sequence = {
+            let Ok(mut sequence) = self.clipboard.sequence.lock() else {
+                return false;
+            };
+            *sequence += 1;
+            *sequence
+        };
+
+        let packet = ClipboardPacket::text(
+            text.to_string(),
+            self.device_id.clone(),
+            self.transport.public_key().to_string(),
+            membership.cluster_id,
+            membership.pair_secret,
+            sequence,
+        );
+        let Ok(payload) = rmp_serde::to_vec_named(&packet) else {
+            return false;
+        };
+
+        let peers = self
+            .clipboard
+            .peers
+            .lock()
+            .map(|peers| peers.clone())
+            .unwrap_or_default();
+        let mut sent = false;
+        for (addr, key, version) in peers {
+            let endpoint = self.transport.peer(addr, key, version);
+            match self.transport.send_stream_expect_ack(endpoint, payload.clone()) {
+                Ok(()) => sent = true,
+                Err(error) => log::debug!("[core] clipboard send failed: {error}"),
+            }
+        }
+        sent
+    }
+
     /// The keyboard layout the controlling machine last announced, or empty if
     /// it has not said — an older desktop simply omits the field.
     pub fn keyboard_layout(&self) -> String {
@@ -233,6 +321,7 @@ pub fn start(config: Config) -> Result<Client, String> {
     let membership = Arc::new(Mutex::new(Membership::load(&config.identity_dir)));
     let layout = Arc::new(Mutex::new(String::new()));
     let screen = Arc::new(Mutex::new((config.screen_width, config.screen_height)));
+    let clipboard = Arc::new(Clipboard::default());
     let challenge = Arc::new(Mutex::new(None));
 
     let transport = start_transport(
@@ -242,6 +331,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         Arc::clone(&queued),
         Arc::clone(&challenge),
         Arc::clone(&membership),
+        Arc::clone(&clipboard),
     )?;
 
     let running = Arc::new(AtomicBool::new(true));
@@ -258,6 +348,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         Arc::clone(&membership),
         Arc::clone(&layout),
         Arc::clone(&screen),
+        Arc::clone(&clipboard),
     )?;
 
     let quic_port = transport.port();
@@ -275,6 +366,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         queued,
         layout,
         screen,
+        clipboard,
     })
 }
 
@@ -287,6 +379,7 @@ fn start_transport(
     queued: Arc<Mutex<usize>>,
     challenge: Arc<Mutex<Option<Challenge>>>,
     membership: Arc<Mutex<Membership>>,
+    clipboard: Arc<Clipboard>,
 ) -> Result<TransportHandle, String> {
     let expected_target = device_id.to_string();
 
@@ -356,10 +449,13 @@ fn start_transport(
             };
         }
 
+        if probe.protocol == CLIPBOARD_PROTOCOL {
+            return accept_clipboard(&clipboard, &membership, &payload, from);
+        }
+
         // Everything else is acknowledged rather than refused. A refused stream
         // makes the sender drop the QUIC connection, and the next input
-        // datagram then pays for re-establishing it — a clipboard we do not
-        // support yet would show up as the cursor stuttering on arrival.
+        // datagram then pays for re-establishing it.
         log_unsupported_stream(&probe.protocol);
         true
     });
@@ -389,6 +485,7 @@ fn spawn_discovery(
     membership: Arc<Mutex<Membership>>,
     layout: Arc<Mutex<String>>,
     screen: Arc<Mutex<(i32, i32)>>,
+    clipboard: Arc<Clipboard>,
 ) -> Result<(), String> {
     let socket = bind_discovery_socket(config.discovery_port)?;
     socket
@@ -451,6 +548,7 @@ fn spawn_discovery(
 
                 remember_peer(&peers_seen, &incoming.peer, from);
                 remember_layout(&layout, &incoming.peer);
+                remember_clipboard_peer(&clipboard, &incoming.peer, from);
 
                 if incoming.kind == "pair-request" {
                     let paired = membership
@@ -773,6 +871,53 @@ fn complete_pairing(
     Ok(())
 }
 
+/// Takes a copy made on another machine.
+///
+/// Authorisation is the same gate the desktop applies: the cluster and the
+/// shared secret must match, so a stray packet from the network cannot push
+/// content onto the phone's clipboard.
+fn accept_clipboard(
+    clipboard: &Arc<Clipboard>,
+    membership: &Arc<Mutex<Membership>>,
+    payload: &[u8],
+    from: SocketAddr,
+) -> bool {
+    let Ok(packet) = rmp_serde::from_slice::<ClipboardPacket>(payload) else {
+        log::warn!("[core] malformed clipboard from {from}");
+        return false;
+    };
+
+    let Ok(joined) = membership.lock() else {
+        return false;
+    };
+    if !joined.is_paired()
+        || packet.cluster_id != joined.cluster_id
+        || packet.pair_secret != joined.pair_secret
+    {
+        log::warn!("[core] clipboard from {from} is not for our cluster");
+        return false;
+    }
+    drop(joined);
+
+    let Some(text) = packet.plain_text() else {
+        // An image copy: acknowledged so the sender keeps its connection, but
+        // this client only handles text.
+        log::debug!("[core] ignoring a non-text clipboard from {from}");
+        return true;
+    };
+
+    // Remember what we applied, so putting it on the system clipboard does not
+    // look like a fresh local copy and bounce straight back.
+    if let Ok(mut last) = clipboard.last_signature.lock() {
+        *last = format!("text:{text}");
+    }
+    if let Ok(mut incoming) = clipboard.incoming.lock() {
+        *incoming = Some(text.to_string());
+    }
+    log::info!("[core] clipboard received, {} characters", text.chars().count());
+    true
+}
+
 /// Adopts the controlling machine's keyboard layout.
 ///
 /// Only a server's word counts: another client's layout says nothing about the
@@ -789,6 +934,29 @@ fn remember_layout(layout: &Arc<Mutex<String>>, peer: &LanPeer) {
     }
     log::info!("[core] controlling machine types on {}", peer.keyboard_layout);
     *current = peer.keyboard_layout.clone();
+}
+
+/// Notes where a peer can be reached for clipboard streams.
+///
+/// The source address is used rather than the advertised one: a machine with
+/// several VLANs announces whichever its default route picked, which may be a
+/// subnet this phone cannot reach at all.
+fn remember_clipboard_peer(clipboard: &Arc<Clipboard>, peer: &LanPeer, from: SocketAddr) {
+    if peer.transport_public_key.trim().is_empty() || peer.quic_port == 0 {
+        return;
+    }
+    let entry = (
+        format!("{}:{}", from.ip(), peer.quic_port),
+        peer.transport_public_key.clone(),
+        peer.protocol_version,
+    );
+    let Ok(mut peers) = clipboard.peers.lock() else {
+        return;
+    };
+    if peers.iter().any(|known| known.0 == entry.0) {
+        return;
+    }
+    peers.push(entry);
 }
 
 fn now_ms() -> u64 {

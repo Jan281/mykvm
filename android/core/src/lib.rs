@@ -151,6 +151,40 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePairingCode(
     to_java_string(&env, &code)
 }
 
+/// Text that arrived from a peer, or empty. Kotlin puts it on the system
+/// clipboard — which only the active keyboard is allowed to do.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeTakeClipboard(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let text = CLIENT
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|running| running.take_clipboard()))
+        .unwrap_or_default();
+    to_java_string(&env, &text)
+}
+
+/// Sends a copy made on this phone. Returns false when there was nothing to do
+/// — not paired, no peers yet, or the same content we just applied from
+/// elsewhere, which is what stops a copy bouncing between machines.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeSendClipboard(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) -> jboolean {
+    let text = take_string(&mut env, &text);
+    let Ok(slot) = CLIENT.lock() else {
+        return 0;
+    };
+    match slot.as_ref() {
+        Some(running) if running.send_clipboard(&text) => 1,
+        _ => 0,
+    }
+}
+
 /// Reports a new screen size after a rotation. Announcing is on a timer, so
 /// nothing has to be pushed — the next announce simply carries the new size.
 #[no_mangle]

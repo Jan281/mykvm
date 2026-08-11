@@ -6,6 +6,7 @@
 //! `PROTOCOL_VERSION` lives in [`transport`] and is the single thing that
 //! decides whether two peers will talk to each other.
 
+pub mod clipboard;
 pub mod discovery;
 pub mod input;
 pub mod packet;

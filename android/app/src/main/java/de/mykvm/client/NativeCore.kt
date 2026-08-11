@@ -38,6 +38,12 @@ object NativeCore {
     /** Reports a new screen size, which on a phone means it was rotated. */
     external fun nativeSetScreen(width: Int, height: Int)
 
+    /** Text a peer copied, or empty. */
+    external fun nativeTakeClipboard(): String
+
+    /** Sends a copy made here. False when there was nothing to do. */
+    external fun nativeSendClipboard(text: String): Boolean
+
     const val KIND_MOUSE_MOVE = 1
     const val KIND_MOUSE_BUTTON = 2
     const val KIND_SCROLL = 3

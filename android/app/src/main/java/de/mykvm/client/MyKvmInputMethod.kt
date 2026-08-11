@@ -17,13 +17,20 @@ import android.widget.TextView
  */
 class MyKvmInputMethod : InputMethodService() {
 
+    private var clipboard: ClipboardBridge? = null
+
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // The clipboard lives here rather than in the service because only the
+        // active input method may read it in the background.
+        clipboard = ClipboardBridge(this).also { it.start() }
         Log.i(MyKvmService.TAG, "input method created")
     }
 
     override fun onDestroy() {
+        clipboard?.stop()
+        clipboard = null
         instance = null
         super.onDestroy()
     }
