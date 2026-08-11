@@ -2433,6 +2433,17 @@ function App() {
                     {ui.layout.modeEdges}
                   </button>
                 </div>
+                {boardMode === "screens" && (
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => {
+                      void reloadScreenConfigurationsFromSystem();
+                    }}
+                  >
+                    {ui.layout.reloadScreens}
+                  </button>
+                )}
                 <span className={`status-pill ${isSaving ? "saving" : ""}`}>
                   {isSaving ? ui.common.saving : ui.common.synced}
                 </span>
@@ -2756,15 +2767,6 @@ function App() {
                         : ui.layout.edgesHint)}
                 </p>
                 <div className="edge-editor-actions">
-                  <button
-                    type="button"
-                    className="secondary-button compact-button"
-                    onClick={() => {
-                      void reloadScreenConfigurationsFromSystem();
-                    }}
-                  >
-                    {ui.layout.edgesReset}
-                  </button>
                   <button
                     type="button"
                     className="secondary-button compact-button"
