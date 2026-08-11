@@ -11,7 +11,9 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import java.io.File
 
@@ -26,6 +28,7 @@ import java.io.File
 class MyKvmService : Service() {
     private var events: CoreEvents? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var cursor: CursorOverlay? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -44,6 +47,11 @@ class MyKvmService : Service() {
 
         acquireMulticastLock()
         bindToWifi()
+        cursor = CursorOverlay(this).also {
+            if (!it.canShow()) {
+                Log.w(TAG, "no overlay permission; the pointer will stay invisible")
+            }
+        }
 
         val metrics = resources.displayMetrics
         val error = NativeCore.nativeStart(
@@ -69,6 +77,9 @@ class MyKvmService : Service() {
     }
 
     override fun onDestroy() {
+        idle.removeCallbacks(hideCursor)
+        cursor?.hide()
+        cursor = null
         events?.stop()
         events = null
         NativeCore.nativeStop()
@@ -79,12 +90,31 @@ class MyKvmService : Service() {
     }
 
     private fun onInput(kind: Int, p1: Int, p2: Int) {
-        // Nothing acts on input yet — the cursor and the accessibility service
-        // come next. Until then this proves the pipeline is alive.
-        if (kind != NativeCore.KIND_MOUSE_MOVE) {
-            Log.i(TAG, "input kind=$kind p1=$p1 p2=$p2")
+        when (kind) {
+            NativeCore.KIND_MOUSE_MOVE -> {
+                cursor?.moveTo(p1, p2)
+                keepCursorVisible()
+            }
+            // Clicks and keys land in the next two steps; logging them keeps
+            // the pipeline observable until then.
+            else -> Log.i(TAG, "input kind=$kind p1=$p1 p2=$p2")
         }
     }
+
+    /**
+     * Hides the pointer once input stops arriving.
+     *
+     * The desktop does not announce that the cursor left — it simply stops
+     * sending — so silence is the only signal we get. Anything shorter than
+     * this would blink the pointer away during a pause in movement.
+     */
+    private fun keepCursorVisible() {
+        idle.removeCallbacks(hideCursor)
+        idle.postDelayed(hideCursor, CURSOR_IDLE_MS)
+    }
+
+    private val idle = Handler(Looper.getMainLooper())
+    private val hideCursor = Runnable { cursor?.hide() }
 
     private fun buildNotification(text: String): Notification {
         val manager = getSystemService(NotificationManager::class.java)
@@ -167,6 +197,7 @@ class MyKvmService : Service() {
         private const val CHANNEL_ID = "mykvm"
         private const val NOTIFICATION_ID = 1
         private const val DISCOVERY_PORT = 47833
+        private const val CURSOR_IDLE_MS = 2000L
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, MyKvmService::class.java))

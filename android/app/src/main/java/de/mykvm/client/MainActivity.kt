@@ -43,6 +43,7 @@ class MainActivity : AppCompatActivity() {
             addView(button("Stop") { MyKvmService.stop(this@MainActivity) })
             addView(button("Allow notifications") { requestNotifications() })
             addView(button("Ignore battery optimisation") { requestBatteryExemption() })
+            addView(button("Allow drawing over other apps") { requestOverlay() })
         }
         setContentView(ScrollView(this).apply { addView(column) })
     }
@@ -82,6 +83,7 @@ class MainActivity : AppCompatActivity() {
             if (code.isEmpty()) null else "Pairing code: $code",
             NativeCore.nativeStatus(),
             batteryHint(),
+            overlayHint(),
             warnIfTunnelled(),
         ).joinToString("\n\n")
     }
@@ -109,6 +111,24 @@ class MainActivity : AppCompatActivity() {
             ),
         )
     }
+
+    /**
+     * The pointer lives in a window over other apps, which Android only grants
+     * from its own settings screen — there is no in-app dialog for it.
+     */
+    private fun requestOverlay() {
+        if (Settings.canDrawOverlays(this)) return
+        startActivity(
+            Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName"),
+            ),
+        )
+    }
+
+    private fun overlayHint(): String? =
+        if (Settings.canDrawOverlays(this)) null
+        else "Drawing over other apps is off; the pointer stays invisible."
 
     private fun isBatteryExempt(): Boolean =
         getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
