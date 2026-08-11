@@ -1448,17 +1448,54 @@ function App() {
     }));
   }
 
+  /**
+   * Where a screen is drawn.
+   *
+   * The board scale shrinks or grows a screen around its own centre, so a phone
+   * scaled down stays among the same neighbours instead of sliding towards its
+   * top-left corner. It changes the picture only — crossings run on edge links,
+   * which are anchored in fractions of a side and do not care how large the
+   * rectangle looks.
+   */
+  const selectedScreen =
+    screens.find((item) => item.id === layout?.selectedScreenId) ?? null;
+
   function boardRect(screen: Screen) {
+    const size = boardScaleOf(screen);
+    const width = screen.width * size;
+    const height = screen.height * size;
+
     return {
       left:
         boardViewport.metrics.offsetX +
-        (screen.x - boardViewport.bounds.minX) * boardViewport.metrics.scale,
+        (screen.x - boardViewport.bounds.minX + (screen.width - width) / 2) *
+          boardViewport.metrics.scale,
       top:
         boardViewport.metrics.offsetY +
-        (screen.y - boardViewport.bounds.minY) * boardViewport.metrics.scale,
-      width: screen.width * boardViewport.metrics.scale,
-      height: screen.height * boardViewport.metrics.scale,
+        (screen.y - boardViewport.bounds.minY + (screen.height - height) / 2) *
+          boardViewport.metrics.scale,
+      width: width * boardViewport.metrics.scale,
+      height: height * boardViewport.metrics.scale,
     };
+  }
+
+  /** A screen written before this setting existed simply draws full size. */
+  function boardScaleOf(screen: Screen) {
+    const value = screen.boardScale ?? 1;
+    return Number.isFinite(value) && value > 0 ? value : 1;
+  }
+
+  function setScreenBoardScale(screenId: string, next: number) {
+    const clamped = Math.round(Math.min(2, Math.max(0.2, next)) * 100) / 100;
+    updateLayout((current) => ({
+      ...current,
+      devices: current.devices.map((device) => ({
+        ...device,
+        screens: device.screens.map((screen) =>
+          screen.id === screenId ? { ...screen, boardScale: clamped } : screen,
+        ),
+      })),
+    }));
   }
 
   function setBoardZoomValue(nextZoom: number) {
@@ -2744,8 +2781,45 @@ function App() {
 
             {boardMode === "screens" ? (
               <div className="edge-editor-bar">
-                <p className="edge-editor-hint">{ui.layout.reloadScreensHint}</p>
+                <p className="edge-editor-hint">
+                  {selectedScreen
+                    ? `${ui.layout.boardScale}: ${selectedScreen.name}`
+                    : ui.layout.reloadScreensHint}
+                </p>
                 <div className="edge-editor-actions">
+                  {selectedScreen ? (
+                    <>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        title={ui.layout.boardScaleHint}
+                        onClick={() =>
+                          setScreenBoardScale(
+                            selectedScreen.id,
+                            boardScaleOf(selectedScreen) - 0.1,
+                          )
+                        }
+                      >
+                        −
+                      </button>
+                      <span className="status-pill">
+                        {Math.round(boardScaleOf(selectedScreen) * 100)}%
+                      </span>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        title={ui.layout.boardScaleHint}
+                        onClick={() =>
+                          setScreenBoardScale(
+                            selectedScreen.id,
+                            boardScaleOf(selectedScreen) + 0.1,
+                          )
+                        }
+                      >
+                        +
+                      </button>
+                    </>
+                  ) : null}
                   <button
                     type="button"
                     className="secondary-button compact-button"
