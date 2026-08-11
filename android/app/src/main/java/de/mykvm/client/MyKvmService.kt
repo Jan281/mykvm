@@ -8,7 +8,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.app.KeyguardManager
 import android.hardware.display.DisplayManager
+import android.os.PowerManager
 import android.view.Display
 import android.view.WindowManager
 import android.net.ConnectivityManager
@@ -33,6 +35,7 @@ class MyKvmService : Service() {
     private var events: CoreEvents? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var cursor: CursorOverlay? = null
+    private var wakeOnInput = true
     /** Where the drawn pointer sits — clicks are dispatched here. */
     private var pointerX = 0
     private var pointerY = 0
@@ -53,6 +56,7 @@ class MyKvmService : Service() {
         }
 
         val settings = Settings(this)
+        wakeOnInput = settings.wakeOnInput
 
         acquireMulticastLock()
         bindToWifi()
@@ -156,6 +160,8 @@ class MyKvmService : Service() {
     }
 
     private fun onInput(kind: Int, p1: Int, p2: Int) {
+        wakeScreenIfNeeded()
+
         when (kind) {
             NativeCore.KIND_MOUSE_MOVE -> {
                 pointerX = p1
@@ -281,6 +287,52 @@ class MyKvmService : Service() {
     }
 
     /**
+     * Turns the screen on when input arrives on a dark phone.
+     *
+     * A pointer moving on a display that is off is the same as no pointer, and
+     * the desktop gives no other sign that the cursor has come over.
+     *
+     * This deliberately does not try to get past the lock screen. Nothing can:
+     * the accessibility service is not allowed to act there, so clicks would
+     * land nowhere. Saying so is the honest response — silently waking a locked
+     * phone that then ignores every click is worse than not waking it.
+     */
+    private fun wakeScreenIfNeeded() {
+        if (!wakeOnInput) return
+        val power = getSystemService(PowerManager::class.java) ?: return
+        if (power.isInteractive) {
+            lockedWarningShown = false
+            return
+        }
+
+        @Suppress("DEPRECATION")
+        val lock = power.newWakeLock(
+            // Deprecated since API 17 and still the only way a service can turn
+            // a screen on; the alternative is launching an activity per
+            // crossing. Some manufacturers restrict it, which is why the
+            // keyguard check below reports rather than assumes success.
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "mykvm:crossing",
+        )
+        // A short hold: the screen's own timeout takes over from here.
+        lock.acquire(WAKE_MS)
+        lock.release()
+
+        warnIfLocked()
+    }
+
+    private var lockedWarningShown = false
+
+    private fun warnIfLocked() {
+        val keyguard = getSystemService(KeyguardManager::class.java) ?: return
+        if (!keyguard.isKeyguardLocked) return
+        if (lockedWarningShown) return
+        lockedWarningShown = true
+        Log.w(TAG, "phone is locked; clicks and typing will not reach any app")
+        updateNotification(getString(R.string.locked))
+    }
+
+    /**
      * Hides the pointer once input stops arriving.
      *
      * The desktop does not announce that the cursor left — it simply stops
@@ -376,6 +428,7 @@ class MyKvmService : Service() {
         private const val CHANNEL_ID = "mykvm"
         private const val NOTIFICATION_ID = 1
         private const val CURSOR_IDLE_MS = 2000L
+        private const val WAKE_MS = 3000L
         // Ordinals from the core's flatten(): Left, Right, Middle, Back, Forward.
         private const val BUTTON_LEFT = 0
         private const val BUTTON_RIGHT = 1

@@ -200,6 +200,7 @@ class MainActivity : ComponentActivity() {
         var name by remember { mutableStateOf(settings.deviceName) }
         var port by remember { mutableStateOf(settings.discoveryPort.toString()) }
         var cursor by remember { mutableStateOf(settings.showCursor) }
+        var wake by remember { mutableStateOf(settings.wakeOnInput) }
         var verbose by remember { mutableStateOf(settings.verboseLogging) }
         var paired by remember { mutableStateOf(MyKvmService.isPaired(this)) }
 
@@ -249,6 +250,16 @@ class MainActivity : ComponentActivity() {
                 onChange = {
                     cursor = it
                     settings.showCursor = it
+                },
+            )
+
+            SwitchRow(
+                label = "Wake on arrival",
+                hint = "Turn the screen on when the pointer comes over",
+                checked = wake,
+                onChange = {
+                    wake = it
+                    settings.wakeOnInput = it
                 },
             )
 

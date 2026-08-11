@@ -46,6 +46,14 @@ class Settings(context: Context) {
         get() = store.getString(KEY_LAYOUT, "") ?: ""
         set(value) = store.edit().putString(KEY_LAYOUT, value).apply()
 
+    /**
+     * Whether an arriving pointer should wake the screen. On by default,
+     * because a cursor moving on a dark display is the same as no cursor.
+     */
+    var wakeOnInput: Boolean
+        get() = store.getBoolean(KEY_WAKE, true)
+        set(value) = store.edit().putBoolean(KEY_WAKE, value).apply()
+
     /** Matches the desktop's log level setting; debug is what a bug report needs. */
     var verboseLogging: Boolean
         get() = store.getBoolean(KEY_VERBOSE, false)
@@ -58,6 +66,7 @@ class Settings(context: Context) {
         const val KEY_CURSOR = "show_cursor"
         const val KEY_LAYOUT = "keyboard_layout"
         const val KEY_VERBOSE = "verbose"
+        const val KEY_WAKE = "wake_on_input"
         const val DEFAULT_PORT = 47833
     }
 }

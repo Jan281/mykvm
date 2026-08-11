@@ -15,6 +15,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Turning the screen on when the pointer arrives; a cursor on a dark
+         display is the same as no cursor. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- The pointer is drawn by us, in a window over whatever app is in front. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 

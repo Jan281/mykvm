@@ -9,4 +9,5 @@
     <string name="accessibility_description">Lets MyKVM tap, drag and scroll where the remote pointer is.</string>
     <string name="needs_keyboard">Select MyKVM as the keyboard so typing works</string>
     <string name="ime_placeholder">MyKVM keyboard — used for remote typing. Switch keyboards to type with your fingers.</string>
+    <string name="locked">Phone is locked — unlock it for clicks and typing to work</string>
 </resources>
