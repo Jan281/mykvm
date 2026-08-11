@@ -25,8 +25,11 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 1. **Install on both machines.** Download the installer for each OS from the [latest release](https://github.com/XxMinor/mykvm/releases/latest).
 2. **Pick roles.** On the machine whose keyboard and mouse you want to share, open MyKVM and keep **Server** mode (the default). On the other machine, open MyKVM and switch to **Client** mode in Settings.
 3. **Connect.** On the same LAN the two find each other automatically. Otherwise open **Devices**, type the other machine's IP (optionally `IP:port`), and click **Add**. Only devices that report their screen info join the layout.
-4. **Arrange screens.** Open **Layout** and drag the monitors so their touching edges match how they sit on your desk.
-5. **Cross over.** Push the cursor past a shared edge — it moves to the other machine. The keyboard follows, and copy/paste works in both directions.
+4. **Arrange screens.** Open **Layout** and drag the machines so they sit as they do on your desk. A machine moves as one block — where its own monitors sit relative to each other is its operating system's answer, and **Reload screen configurations** pulls that in again after you change it there. Hold **Alt** to drop a machine exactly where you let go, ignoring snapping. Each machine can also be drawn smaller or larger, for a phone that has more pixels than a monitor across a fraction of the width.
+5. **Wire the edges.** Switch the layout to **Edge links** and connect the edges you want to cross at. Only what is connected is crossable, so an arrangement that merely looks adjacent does nothing.
+6. **Cross over.** Push the cursor past a connected edge — it moves to the other machine. The keyboard follows, and copy/paste works in both directions.
+
+An **Android phone** can join as a client too — see [`android/README.md`](android/README.md) for what it can do and how to build it.
 
 ## Permissions
 
