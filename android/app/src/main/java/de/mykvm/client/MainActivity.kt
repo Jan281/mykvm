@@ -1,205 +1,143 @@
 package de.mykvm.client
 
-import android.content.Context
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.net.wifi.WifiManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 /**
- * The smoke-test screen: start the core, show what it sees, log every event.
+ * The setup screen.
  *
- * Deliberately not a service yet. This exists to answer one question — do
- * discovery and QUIC work on a phone at all — before three Android components
- * are built on top of that assumption.
+ * It starts and stops the service and walks the user through the system
+ * switches Android will not grant an app on its own. Everything it shows is
+ * read from the core, which lives in the service's process — so this window can
+ * be destroyed and reopened without disturbing anything.
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
-    private lateinit var log: TextView
-    private var events: CoreEvents? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        status = TextView(this).apply { setPadding(0, 0, 0, 24) }
-        log = TextView(this)
-        val start = Button(this).apply {
-            text = "Start"
-            setOnClickListener { startCore() }
-        }
-        val stop = Button(this).apply {
-            text = "Stop"
-            setOnClickListener { stopCore() }
-        }
-        val refresh = Button(this).apply {
-            text = "Status"
-            setOnClickListener { showStatus() }
-        }
+        status = TextView(this).apply { setPadding(0, 0, 0, 32) }
 
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
             addView(status)
-            addView(start)
-            addView(stop)
-            addView(refresh)
-            addView(log)
+            addView(button("Start") { MyKvmService.start(this@MainActivity) })
+            addView(button("Stop") { MyKvmService.stop(this@MainActivity) })
+            addView(button("Allow notifications") { requestNotifications() })
+            addView(button("Ignore battery optimisation") { requestBatteryExemption() })
         }
         setContentView(ScrollView(this).apply { addView(column) })
-
-        status.text = "idle"
     }
 
-    private fun startCore() {
-        if (events != null) {
-            showStatus()
-            return
-        }
-
-        // Without this, Android's Wi-Fi stack filters broadcast packets before
-        // they ever reach the socket — discovery would be deaf while looking
-        // perfectly healthy from the inside.
-        acquireMulticastLock()
-        bindToWifi()
-
-        val metrics = resources.displayMetrics
-        val error = NativeCore.nativeStart(
-            Build.MODEL ?: "Android",
-            DISCOVERY_PORT,
-            metrics.widthPixels,
-            metrics.heightPixels,
-            filesDir.absolutePath,
-        )
-
-        if (error.isNotEmpty()) {
-            status.text = "start failed: $error"
-            Log.e(TAG, "start failed: $error")
-            return
-        }
-
-        events = CoreEvents { kind, p1, p2 -> onInput(kind, p1, p2) }.also { it.start() }
+    override fun onResume() {
+        super.onResume()
         status.post(refresh)
     }
 
-    private fun stopCore() {
+    override fun onPause() {
         status.removeCallbacks(refresh)
-        events?.stop()
-        events = null
-        NativeCore.nativeStop()
-        multicastLock?.let { if (it.isHeld) it.release() }
-        multicastLock = null
-        status.text = "stopped"
+        super.onPause()
     }
 
-    private fun showStatus() {
-        val code = NativeCore.nativePairingCode()
-        val pairing = if (code.isEmpty()) null else "Pairing code: $code"
-        val warning = warnIfTunnelled()
-        status.text = listOfNotNull(pairing, NativeCore.nativeStatus(), warning)
-            .joinToString("\n\n")
+    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        setOnClickListener { onClick() }
     }
 
     /**
-     * Keeps the screen current while the core runs.
+     * Redraws once a second while the window is open.
      *
      * The pairing code appears when the desktop asks for it and expires on its
-     * own, so it has to show up without the user tapping anything — they are
-     * looking at the desktop at that moment, not at the phone.
+     * own, so it has to show up without the user tapping anything — at that
+     * moment they are looking at the desktop, not at the phone.
      */
     private val refresh = object : Runnable {
         override fun run() {
             showStatus()
-            if (events != null) status.postDelayed(this, 1000)
+            status.postDelayed(this, 1000)
         }
     }
 
-    private fun onInput(kind: Int, p1: Int, p2: Int) {
-        val line = when (kind) {
-            NativeCore.KIND_MOUSE_MOVE -> "move $p1,$p2"
-            NativeCore.KIND_MOUSE_BUTTON -> "button $p1 down=$p2"
-            NativeCore.KIND_SCROLL -> "scroll $p1,$p2"
-            NativeCore.KIND_KEY -> "key 0x${p1.toString(16)} down=$p2"
-            else -> "unknown $kind"
+    private fun showStatus() {
+        val code = NativeCore.nativePairingCode()
+        status.text = listOfNotNull(
+            if (code.isEmpty()) null else "Pairing code: $code",
+            NativeCore.nativeStatus(),
+            batteryHint(),
+            warnIfTunnelled(),
+        ).joinToString("\n\n")
+    }
+
+    private fun requestNotifications() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
         }
-        Log.i(TAG, line)
-        // Only moves are frequent enough to flood the view; the rest is rare.
-        if (kind != NativeCore.KIND_MOUSE_MOVE) {
-            runOnUiThread { log.append("$line\n") }
-        }
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
     }
 
     /**
-     * Pins this process's sockets to Wi-Fi, so a LAN protocol does not go out
-     * over mobile data. Must happen before the core opens any socket, since
-     * existing ones are not moved.
-     *
-     * This is **not** a way around a VPN, though it looks like one. A VPN that
-     * declares itself non-bypassable covers every UID and the system refuses to
-     * let an app route around it — the call still succeeds, it just changes
-     * nothing. The symptom is a one-way network: broadcasts from the LAN still
-     * arrive on Wi-Fi, while everything sent disappears into the tunnel. The
-     * fix lives in the VPN's own settings (Proton: Connection, Advanced, LAN
-     * connections), not here; [warnIfTunnelled] says so out loud.
+     * Android will otherwise put the service to sleep after a while of screen-
+     * off, and the phone silently drops out of the cluster.
      */
-    private fun bindToWifi() {
-        val manager = getSystemService(ConnectivityManager::class.java) ?: return
-        @Suppress("DEPRECATION")
-        val wifi = manager.allNetworks.firstOrNull { network ->
-            manager.getNetworkCapabilities(network)
-                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-        }
-
-        if (wifi == null) {
-            Log.w(TAG, "no Wi-Fi network to bind to; leaving routing alone")
-            return
-        }
-        manager.bindProcessToNetwork(wifi)
-        Log.i(TAG, "bound process to Wi-Fi")
+    private fun requestBatteryExemption() {
+        if (isBatteryExempt()) return
+        startActivity(
+            Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName"),
+            ),
+        )
     }
+
+    private fun isBatteryExempt(): Boolean =
+        getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+
+    private fun batteryHint(): String? =
+        if (isBatteryExempt()) null else "Battery optimisation is on; the client may be stopped in the background."
 
     /**
      * Names the one condition that makes MyKVM look broken for no visible
      * reason, rather than letting the user hunt for it.
+     *
+     * A VPN that declares itself non-bypassable covers every UID, and the
+     * system refuses to let an app route around it — binding to Wi-Fi succeeds
+     * and changes nothing. The symptom is a one-way network: broadcasts from
+     * the LAN still arrive, while everything sent disappears into the tunnel.
+     * The fix lives in the VPN's settings (Proton: Connection, Advanced, LAN
+     * connections), not in this app.
      */
     private fun warnIfTunnelled(): String? {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return null
         @Suppress("DEPRECATION")
-        val blocking = manager.allNetworks.any { network ->
+        val tunnelled = manager.allNetworks.any { network ->
             val capabilities = manager.getNetworkCapabilities(network) ?: return@any false
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
                 !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
         }
 
-        if (!blocking) return null
-        val hint = "A VPN is active. If no peer appears, allow LAN connections in its settings."
-        Log.w(TAG, hint)
-        return hint
-    }
-
-    private fun acquireMulticastLock() {
-        if (multicastLock?.isHeld == true) return
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        multicastLock = wifi.createMulticastLock("mykvm-discovery").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-    }
-
-    override fun onDestroy() {
-        stopCore()
-        super.onDestroy()
-    }
-
-    private companion object {
-        const val TAG = "mykvm"
-        const val DISCOVERY_PORT = 47833
+        if (!tunnelled) return null
+        Log.w(MyKvmService.TAG, "a non-bypassable VPN is active")
+        return "A VPN is active. If no peer appears, allow LAN connections in its settings."
     }
 }

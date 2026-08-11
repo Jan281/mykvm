@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MyKVM</string>
+    <string name="channel_name">Client running</string>
+    <string name="service_starting">Starting…</string>
+    <string name="service_failed">Could not start: %1$s</string>
+    <string name="action_stop">Stop</string>
+</resources>
