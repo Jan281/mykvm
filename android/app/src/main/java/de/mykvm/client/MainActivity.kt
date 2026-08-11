@@ -99,7 +99,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showStatus() {
-        status.text = NativeCore.nativeStatus()
+        val warning = warnIfTunnelled()
+        status.text = listOfNotNull(NativeCore.nativeStatus(), warning).joinToString("\n\n")
     }
 
     private fun onInput(kind: Int, p1: Int, p2: Int) {
@@ -118,13 +119,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Pins this process's sockets to Wi-Fi.
+     * Pins this process's sockets to Wi-Fi, so a LAN protocol does not go out
+     * over mobile data. Must happen before the core opens any socket, since
+     * existing ones are not moved.
      *
-     * A VPN takes over the default route and swallows everything the app sends,
-     * which shows up as a maddening asymmetry: the phone hears the desktop's
-     * broadcasts on Wi-Fi, but nothing it sends ever leaves the tunnel. Binding
-     * has to happen before the core opens any socket, since existing ones are
-     * not moved.
+     * This is **not** a way around a VPN, though it looks like one. A VPN that
+     * declares itself non-bypassable covers every UID and the system refuses to
+     * let an app route around it — the call still succeeds, it just changes
+     * nothing. The symptom is a one-way network: broadcasts from the LAN still
+     * arrive on Wi-Fi, while everything sent disappears into the tunnel. The
+     * fix lives in the VPN's own settings (Proton: Connection, Advanced, LAN
+     * connections), not here; [warnIfTunnelled] says so out loud.
      */
     private fun bindToWifi() {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return
@@ -140,6 +145,25 @@ class MainActivity : AppCompatActivity() {
         }
         manager.bindProcessToNetwork(wifi)
         Log.i(TAG, "bound process to Wi-Fi")
+    }
+
+    /**
+     * Names the one condition that makes MyKVM look broken for no visible
+     * reason, rather than letting the user hunt for it.
+     */
+    private fun warnIfTunnelled(): String? {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return null
+        @Suppress("DEPRECATION")
+        val blocking = manager.allNetworks.any { network ->
+            val capabilities = manager.getNetworkCapabilities(network) ?: return@any false
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }
+
+        if (!blocking) return null
+        val hint = "A VPN is active. If no peer appears, allow LAN connections in its settings."
+        Log.w(TAG, hint)
+        return hint
     }
 
     private fun acquireMulticastLock() {

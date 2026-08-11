@@ -257,7 +257,7 @@ fn spawn_discovery(
                     continue;
                 }
 
-                remember_peer(&peers_seen, &incoming.peer);
+                remember_peer(&peers_seen, &incoming.peer, from);
 
                 if matches!(incoming.kind.as_str(), "announce" | "probe") {
                     let peer = build_peer(
@@ -309,7 +309,11 @@ fn build_peer(
         platform: "android".into(),
         machine_role: "client".into(),
         cluster_id: String::new(),
-        pairing_required: false,
+        // Until we have joined a cluster we must announce ourselves as needing
+        // to pair. A server accepts an unknown peer on exactly that condition
+        // (`peer_visible_to_layout`); claiming to be configured while carrying
+        // no cluster id makes it drop us without a word.
+        pairing_required: true,
         host: name.to_string(),
         ip: ip.to_string(),
         transport_port: base_port,
@@ -416,20 +420,45 @@ fn reply(socket: &UdpSocket, peer: &LanPeer, from: SocketAddr, advertised_ip: &s
         destinations.push(advertised_ip.to_string());
     }
 
-    for address in destinations {
+    let mut sent = 0usize;
+    let mut failure: Option<String> = None;
+    for address in &destinations {
         for port in discovery_target_ports(base_port) {
-            let _ = socket.send_to(&payload, (address.as_str(), port));
+            match socket.send_to(&payload, (address.as_str(), port)) {
+                Ok(_) => sent += 1,
+                Err(error) => {
+                    failure.get_or_insert_with(|| format!("{address}:{port}: {error}"));
+                }
+            }
         }
     }
+
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| match failure {
+        Some(reason) => log::warn!("[core] answered {destinations:?}, {sent} sends ok, {reason}"),
+        None => log::info!("[core] answering {destinations:?} on every discovery port ({sent} sends)"),
+    });
 }
 
-fn remember_peer(peers: &Arc<Mutex<Vec<String>>>, peer: &LanPeer) {
+/// Records a peer under both addresses that matter.
+///
+/// The advertised one is what the peer believes it is reachable at; the source
+/// one is where its packet actually came from. On a machine with several VLANs
+/// those differ, and only the source address is known to be routable from here
+/// — so if the two disagree, that is worth seeing rather than guessing at.
+fn remember_peer(peers: &Arc<Mutex<Vec<String>>>, peer: &LanPeer, from: SocketAddr) {
     let Ok(mut peers) = peers.lock() else {
         return;
     };
     let label = format!("{} ({})", peer.name, peer.ip);
     if !peers.contains(&label) {
-        log::info!("[core] discovered {label}");
+        if peer.ip.trim() == from.ip().to_string() {
+            log::info!("[core] discovered {label} from {from}");
+        } else {
+            log::info!(
+                "[core] discovered {label} but its packet came from {from} — answering both"
+            );
+        }
         peers.push(label);
     }
 }
