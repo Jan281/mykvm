@@ -16,7 +16,71 @@ import android.view.KeyEvent
  */
 object KeyMap {
 
-    enum class Layout { GERMAN, US }
+    enum class Layout {
+        GERMAN,
+        US,
+        /**
+         * US keys, but the quote and tilde positions are dead keys that
+         * compose accents onto the next character. This is what makes umlauts
+         * reachable on a US board, and it is what the machine this was built
+         * against actually uses.
+         */
+        US_INTERNATIONAL,
+        ;
+
+        companion object {
+            /** Parses what the controlling machine announces, e.g. "us(intl)". */
+            fun parse(announced: String): Layout? {
+                val text = announced.lowercase()
+                return when {
+                    text.isBlank() -> null
+                    text.startsWith("de") -> GERMAN
+                    text.contains("intl") || text.contains("altgr-intl") -> US_INTERNATIONAL
+                    text.startsWith("us") -> US
+                    else -> null
+                }
+            }
+        }
+    }
+
+    /** A key that waits for the next one and combines with it. */
+    private val DEAD_KEYS = mapOf(
+        0xDE to Pair('\'', '"'),   // ' and " on a US board
+        0xC0 to Pair('`', '~'),
+    )
+
+    /**
+     * Whether this key, on this layout, waits for the next one.
+     *
+     * Returns the accent it carries, or null if the key stands alone.
+     */
+    fun deadKeyFor(vk: Int, shift: Boolean, layout: Layout): Char? {
+        if (layout != Layout.US_INTERNATIONAL) return null
+        val (base, shifted) = DEAD_KEYS[vk] ?: return null
+        return if (shift) shifted else base
+    }
+
+    /**
+     * Combines a pending accent with the key that followed.
+     *
+     * Returns null when the pair has no accented form — US-International then
+     * emits the accent followed by the character, which is how a stray quote
+     * gets typed at all.
+     */
+    fun compose(accent: Char, character: Char): Char? = COMPOSED["$accent$character"]
+
+    private val COMPOSED: Map<String, Char> = buildMap {
+        fun pair(accent: Char, plain: String, accented: String) {
+            plain.forEachIndexed { index, character ->
+                put("$accent$character", accented[index])
+            }
+        }
+        pair('"', "aeiouyAEIOUY", "äëïöüÿÄËÏÖÜŸ")
+        pair('\'', "aeiouycAEIOUYC", "áéíóúýçÁÉÍÓÚÝÇ")
+        pair('`', "aeiouAEIOU", "àèìòùÀÈÌÒÙ")
+        pair('^', "aeiouAEIOU", "âêîôûÂÊÎÔÛ")
+        pair('~', "anoANO", "ãñõÃÑÕ")
+    }
 
     /** What a printable key produces, unshifted / shifted / with AltGr. */
     private data class Printable(val base: Char, val shift: Char, val altGr: Char? = null)
@@ -24,7 +88,12 @@ object KeyMap {
     fun keyCodeFor(vk: Int): Int? = CONTROL_KEYS[vk]
 
     fun characterFor(vk: Int, shift: Boolean, altGr: Boolean, layout: Layout): Char? {
-        val table = if (layout == Layout.GERMAN) GERMAN else US
+        val table = when (layout) {
+            Layout.GERMAN -> GERMAN
+            // US-International shares the US table; only the dead keys and
+            // AltGr combinations differ, and those are handled apart.
+            else -> US
+        }
         val entry = table[vk] ?: return null
         return when {
             altGr -> entry.altGr

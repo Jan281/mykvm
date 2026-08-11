@@ -135,12 +135,39 @@ class MyKvmService : Service() {
             return
         }
 
+        adoptAnnouncedLayout()
+
         val keyboard = MyKvmInputMethod.instance
         if (keyboard == null) {
             warnNoKeyboard()
             return
         }
         keyboard.onRemoteKey(vk, down, modifiers)
+    }
+
+    private var lastAnnouncedLayout = ""
+
+    /**
+     * Takes the keyboard layout from the machine doing the typing.
+     *
+     * Key codes on the wire are positional so that each receiver applies its
+     * own layout — but a phone has none for injected keys, so it borrows the
+     * controlling machine's rather than guessing. Read per keystroke because
+     * that is rare enough for the cost not to matter, and it means a layout
+     * change on the desktop takes effect without restarting anything.
+     */
+    private fun adoptAnnouncedLayout() {
+        val announced = NativeCore.nativeKeyboardLayout()
+        if (announced == lastAnnouncedLayout) return
+        lastAnnouncedLayout = announced
+
+        val layout = KeyMap.Layout.parse(announced)
+        if (layout == null) {
+            if (announced.isNotEmpty()) Log.w(TAG, "unknown keyboard layout '$announced'")
+            return
+        }
+        Log.i(TAG, "typing as $layout, announced as '$announced'")
+        MyKvmInputMethod.layout = layout
     }
 
     private var warnedAboutKeyboard = false

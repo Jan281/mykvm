@@ -137,6 +137,8 @@ pub struct Client {
     membership: Arc<Mutex<Membership>>,
     /// How many events are enqueued but not yet polled.
     queued: Arc<Mutex<usize>>,
+    /// The keyboard layout the controlling machine announced.
+    layout: Arc<Mutex<String>>,
 }
 
 impl Client {
@@ -182,6 +184,12 @@ impl Client {
         )
     }
 
+    /// The keyboard layout the controlling machine last announced, or empty if
+    /// it has not said — an older desktop simply omits the field.
+    pub fn keyboard_layout(&self) -> String {
+        self.layout.lock().map(|layout| layout.clone()).unwrap_or_default()
+    }
+
     /// The code the user has to type on the desktop, while it is valid.
     pub fn pairing_code(&self) -> Option<String> {
         let challenge = self.challenge.lock().ok()?;
@@ -201,6 +209,7 @@ pub fn start(config: Config) -> Result<Client, String> {
     let queued = Arc::new(Mutex::new(0usize));
 
     let membership = Arc::new(Mutex::new(Membership::load(&config.identity_dir)));
+    let layout = Arc::new(Mutex::new(String::new()));
     let challenge = Arc::new(Mutex::new(None));
 
     let transport = start_transport(
@@ -224,6 +233,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         Arc::clone(&peers_seen),
         Arc::clone(&challenge),
         Arc::clone(&membership),
+        Arc::clone(&layout),
     )?;
 
     let quic_port = transport.port();
@@ -239,6 +249,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         challenge,
         membership,
         queued,
+        layout,
     })
 }
 
@@ -351,6 +362,7 @@ fn spawn_discovery(
     peers_seen: Arc<Mutex<Vec<String>>>,
     challenge: Arc<Mutex<Option<Challenge>>>,
     membership: Arc<Mutex<Membership>>,
+    layout: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     let socket = bind_discovery_socket(config.discovery_port)?;
     socket
@@ -410,6 +422,7 @@ fn spawn_discovery(
                 }
 
                 remember_peer(&peers_seen, &incoming.peer, from);
+                remember_layout(&layout, &incoming.peer);
 
                 if incoming.kind == "pair-request" {
                     let paired = membership
@@ -506,6 +519,8 @@ fn build_peer(
         }],
         app_version: env!("CARGO_PKG_VERSION").into(),
         last_seen_ms: now_ms(),
+        // A phone has no layout of its own to offer; it borrows one.
+        keyboard_layout: String::new(),
     }
 }
 
@@ -728,6 +743,24 @@ fn complete_pairing(
 
     log::info!("[core] paired with {} ({})", packet.peer.name, cluster_id.trim());
     Ok(())
+}
+
+/// Adopts the controlling machine's keyboard layout.
+///
+/// Only a server's word counts: another client's layout says nothing about the
+/// keyboard whose keys are arriving here.
+fn remember_layout(layout: &Arc<Mutex<String>>, peer: &LanPeer) {
+    if peer.machine_role != "server" || peer.keyboard_layout.trim().is_empty() {
+        return;
+    }
+    let Ok(mut current) = layout.lock() else {
+        return;
+    };
+    if *current == peer.keyboard_layout {
+        return;
+    }
+    log::info!("[core] controlling machine types on {}", peer.keyboard_layout);
+    *current = peer.keyboard_layout.clone();
 }
 
 fn now_ms() -> u64 {

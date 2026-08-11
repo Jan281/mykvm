@@ -31,6 +31,9 @@ object NativeCore {
     /** The code to type on the desktop, or empty while none is pending. */
     external fun nativePairingCode(): String
 
+    /** The layout the controlling machine types on, e.g. "us(intl)". */
+    external fun nativeKeyboardLayout(): String
+
     const val KIND_MOUSE_MOVE = 1
     const val KIND_MOUSE_BUTTON = 2
     const val KIND_SCROLL = 3

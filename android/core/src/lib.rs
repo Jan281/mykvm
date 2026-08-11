@@ -144,6 +144,22 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePairingCode(
     to_java_string(&env, &code)
 }
 
+/// The keyboard layout the controlling machine announced, or empty. The client
+/// applies it rather than guessing, since a phone has no layout of its own for
+/// injected keys.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeKeyboardLayout(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let layout = CLIENT
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|running| running.keyboard_layout()))
+        .unwrap_or_default();
+    to_java_string(&env, &layout)
+}
+
 /// A one-line summary for the setup screen: our id, our QUIC port and which
 /// peers we have heard from.
 #[no_mangle]

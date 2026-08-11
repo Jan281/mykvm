@@ -36,7 +36,7 @@ pub use mykvm_protocol::transport as quic_transport;
 use mykvm_protocol::discovery::{
     broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
     normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
-    local_peer_id, random_pairing_code, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen,
+    detect_keyboard_layout, local_peer_id, random_pairing_code, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen,
     DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     TRANSPORT_PORT_MAX,
 };
@@ -5961,6 +5961,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
         app_version: env!("CARGO_PKG_VERSION").into(),
+        keyboard_layout: detect_keyboard_layout(),
         last_seen_ms: now_ms(),
     }
 }
@@ -6989,6 +6990,7 @@ mod tests {
                 is_primary: true,
             }],
             app_version: "test".into(),
+            keyboard_layout: String::new(),
             last_seen_ms: now_ms(),
         }
     }
@@ -7976,6 +7978,7 @@ mod tests {
             upgrading: false,
             screens: vec![],
             app_version: "0.1.0".into(),
+            keyboard_layout: String::new(),
             last_seen_ms: now_ms(),
         }];
 

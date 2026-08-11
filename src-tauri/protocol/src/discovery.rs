@@ -394,6 +394,15 @@ pub struct LanPeer {
     pub screens: Vec<LanPeerScreen>,
     pub app_version: String,
     pub last_seen_ms: u64,
+    /// The keyboard layout this machine's user types on, e.g. `"us(intl)"`.
+    ///
+    /// Key codes on the wire are positional, so a receiver normally applies its
+    /// own layout — that is the whole point of the design. A phone has none for
+    /// injected keys, so it borrows the controlling machine's. Defaulted rather
+    /// than required, so a peer that predates this field is simply quiet about
+    /// it instead of failing to decode.
+    #[serde(default)]
+    pub keyboard_layout: String,
 }
 
 /// One screen of a peer, in that peer's own layout coordinates.
@@ -427,4 +436,45 @@ pub struct DiscoveryPacket {
     pub pair_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_error: Option<String>,
+}
+
+/// Reads the keyboard layout this machine's user types on.
+///
+/// Only Linux is implemented, because that is the only platform that currently
+/// captures input — a machine that never captures has no layout worth
+/// announcing. An empty string means "unknown", which leaves the client on
+/// whatever it was configured with rather than guessing wrong.
+#[cfg(target_os = "linux")]
+pub fn detect_keyboard_layout() -> String {
+    // localectl reports what the session is actually using, including the
+    // variant — and the variant is the whole story here: plain `us` and
+    // `us(intl)` differ in exactly the keys that produce accents.
+    let Ok(output) = std::process::Command::new("localectl").arg("status").output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let layout = field("X11 Layout:");
+    if layout.is_empty() {
+        return String::new();
+    }
+    match field("X11 Variant:") {
+        variant if variant.is_empty() => layout,
+        variant => format!("{layout}({variant})"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_keyboard_layout() -> String {
+    String::new()
 }

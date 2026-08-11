@@ -41,6 +41,9 @@ class MyKvmInputMethod : InputMethodService() {
         setPadding(48, 48, 48, 48)
     }
 
+    /** An accent waiting for the key it belongs to. */
+    private var pendingAccent: Char? = null
+
     /**
      * Types one key that arrived from the desktop.
      *
@@ -77,12 +80,30 @@ class MyKvmInputMethod : InputMethodService() {
             return
         }
 
+        // A dead key types nothing yet; it waits for the next one. This is
+        // how umlauts are reached on a US-International board at all.
+        KeyMap.deadKeyFor(vk, modifiers.shift, layout)?.let { accent ->
+            pendingAccent = accent
+            return
+        }
+
         val character = KeyMap.characterFor(vk, modifiers.shift, modifiers.altGr, layout)
         if (character == null) {
             Log.d(MyKvmService.TAG, "no mapping for vk 0x${vk.toString(16)}")
             return
         }
-        connection.commitText(character.toString(), 1)
+
+        val accent = pendingAccent
+        pendingAccent = null
+        if (accent == null) {
+            connection.commitText(character.toString(), 1)
+            return
+        }
+
+        // No accented form for this pair: the accent stands on its own and the
+        // character follows, which is how a bare quote gets typed.
+        val composed = KeyMap.compose(accent, character)
+        connection.commitText(composed?.toString() ?: "$accent$character", 1)
     }
 
     /**
@@ -125,10 +146,12 @@ class MyKvmInputMethod : InputMethodService() {
             private set
 
         /**
-         * The layout the controlling machine uses. German for now because that
-         * is what this was built against; it belongs in settings once there is
-         * a second user.
+         * The layout the controlling machine uses.
+         *
+         * Overwritten by whatever that machine announces; this value only
+         * covers the gap before the first announce arrives, and the case of a
+         * desktop too old to send one.
          */
-        var layout: KeyMap.Layout = KeyMap.Layout.GERMAN
+        var layout: KeyMap.Layout = KeyMap.Layout.US_INTERNATIONAL
     }
 }
