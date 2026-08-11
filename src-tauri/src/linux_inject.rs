@@ -14,29 +14,50 @@
 //! must never block on D-Bus — can hand off work with a cheap, non-blocking
 //! send.
 //!
-//! Only relative pointer motion is available: absolute placement
-//! (`notify_pointer_motion_absolute`) needs a Screencast stream id, and this
-//! module deliberately never negotiates a Screencast (there is nothing to
-//! show — only input is being injected). So an absolute `(x, y)` target from
-//! the wire is turned into a delta against the last position we synced to,
-//! the same "first sample only establishes the origin" rule
-//! `linux_input.rs::translate_ei_event` already applies on the capture side.
+//! Pointer placement goes through **libei**, not through the portal's own
+//! `notify_pointer_*` calls. The portal offers absolute placement only via
+//! `notify_pointer_motion_absolute`, which needs a Screencast stream id, and
+//! negotiating a Screencast just to move a cursor would cost the user a
+//! sharing prompt and a permanent "screen is being shared" indicator for a
+//! stream nobody watches. `RemoteDesktop.ConnectToEIS` avoids that: it hands
+//! back a libei socket on which the compositor exposes an *absolute* pointer
+//! whose regions are the screens themselves, so a wire coordinate can be
+//! placed exactly.
+//!
+//! The relative path (`notify_pointer_motion` against a remembered position)
+//! is kept only as a fallback for portal backends too old to implement
+//! `ConnectToEIS`, and it is a genuinely worse one: dead reckoning has no
+//! feedback, so pointer acceleration applied to injected motion and clamping
+//! at a screen edge both push the real cursor away from where this side
+//! believes it is, permanently and cumulatively. That drift is what made a
+//! cursor cross to a neighbouring screen long before reaching the edge.
 
 use std::{
     collections::HashMap,
+    os::unix::net::UnixStream,
     sync::{mpsc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ashpd::desktop::{
     remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop},
     PersistMode, Session,
 };
+use futures_util::StreamExt;
+use reis::{
+    ei,
+    event::{Connection, DeviceCapability, EiEvent},
+};
 
 use crate::{
     linux_input::{self, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE},
     shared_input::MouseButton,
 };
+
+/// One wheel notch, in the 120ths libei counts scrolling in — the same unit
+/// Windows calls `WHEEL_DELTA`, which is why the wire carries plain notches
+/// and each platform multiplies on its way out.
+const EI_SCROLL_UNIT: i32 = 120;
 
 /// Inverts `linux_input::evdev_to_windows_vk`, built once from that single
 /// source of truth rather than duplicating its ~80-arm match by hand — the
@@ -179,6 +200,249 @@ pub fn inject_key(key_code: u16, down: bool) {
     }
 }
 
+/// Turns a wire scroll, counted in whole notches with Windows' sign, into
+/// libei's 120ths with Wayland's. Only the vertical axis flips: both sides
+/// agree that positive horizontal means rightwards.
+fn scroll_to_ei(delta_x: i32, delta_y: i32) -> (i32, i32) {
+    (delta_x * EI_SCROLL_UNIT, -delta_y * EI_SCROLL_UNIT)
+}
+
+/// One libei device the compositor offered us, and whether it may be driven
+/// right now. A device arrives paused and has to be resumed before anything
+/// sent on it counts; emulating is a second, client-side bracket around the
+/// events themselves.
+struct EisDevice {
+    device: reis::event::Device,
+    resumed: bool,
+    emulating: bool,
+}
+
+/// The libei sender connection — the whole reason this module exists in its
+/// current form, since it is what makes absolute placement possible.
+struct EisSink {
+    connection: Connection,
+    devices: Vec<EisDevice>,
+    /// libei wants a monotonically rising sequence per emulation bracket.
+    sequence: u32,
+    /// Frame timestamps are microseconds on an arbitrary monotonic clock, so
+    /// the process start is as good an epoch as any.
+    started: Instant,
+}
+
+impl EisSink {
+    /// Sends one event on the first resumed device offering interface `T`,
+    /// wrapped in the emulation bracket and the frame libei requires.
+    /// Returns false when no device can carry it — during the moment between
+    /// the grant and the compositor resuming its devices, for instance.
+    fn emit<T, F>(&mut self, apply: F) -> bool
+    where
+        T: ei::Interface,
+        F: FnOnce(&T),
+    {
+        let Some(index) = self
+            .devices
+            .iter()
+            .position(|entry| entry.resumed && entry.device.interface::<T>().is_some())
+        else {
+            return false;
+        };
+        let interface = self.devices[index]
+            .device
+            .interface::<T>()
+            .expect("the position() above just matched on this interface");
+
+        self.start_emulating(index);
+        apply(&interface);
+
+        // One frame per event: libei treats everything between two frames as
+        // simultaneous, and explicitly forbids two scrolls in one frame.
+        let serial = self.connection.serial();
+        let timestamp = self.started.elapsed().as_micros() as u64;
+        self.devices[index].device.device().frame(serial, timestamp);
+        let _ = self.connection.flush();
+        true
+    }
+
+    fn start_emulating(&mut self, index: usize) {
+        if self.devices[index].emulating {
+            return;
+        }
+        let serial = self.connection.serial();
+        self.sequence = self.sequence.wrapping_add(1);
+        let sequence = self.sequence;
+        let entry = &mut self.devices[index];
+        entry.device.device().start_emulating(serial, sequence);
+        entry.emulating = true;
+    }
+
+    /// Tracks the device lifecycle. A pause revokes the emulation bracket on
+    /// the server's side, so the flag has to fall with it — otherwise the
+    /// next event would be sent into a bracket that no longer exists.
+    fn apply_lifecycle(&mut self, event: &EiEvent) {
+        match event {
+            EiEvent::DeviceAdded(added) => {
+                let regions: Vec<String> = added
+                    .device
+                    .regions()
+                    .iter()
+                    .map(|region| {
+                        format!(
+                            "{}x{}+{}+{}@{}",
+                            region.width, region.height, region.x, region.y, region.scale
+                        )
+                    })
+                    .collect();
+                // Worth a line: these regions are the coordinate space every
+                // absolute position is interpreted in, so a layout that does
+                // not match what the sender thinks it is addressing shows up
+                // here rather than as a cursor in the wrong place.
+                log::info!(
+                    "[wayland] inject device {:?} regions [{}]",
+                    added.device.name().unwrap_or("<unnamed>"),
+                    regions.join(", ")
+                );
+                self.devices.push(EisDevice {
+                    device: added.device.clone(),
+                    resumed: false,
+                    emulating: false,
+                });
+            }
+            EiEvent::DeviceRemoved(removed) => {
+                self.devices.retain(|entry| entry.device != removed.device);
+            }
+            EiEvent::DeviceResumed(resumed) => {
+                if let Some(entry) = self
+                    .devices
+                    .iter_mut()
+                    .find(|entry| entry.device == resumed.device)
+                {
+                    entry.resumed = true;
+                    entry.emulating = false;
+                }
+            }
+            EiEvent::DevicePaused(paused) => {
+                if let Some(entry) = self
+                    .devices
+                    .iter_mut()
+                    .find(|entry| entry.device == paused.device)
+                {
+                    entry.resumed = false;
+                    entry.emulating = false;
+                }
+            }
+            EiEvent::SeatAdded(seat) => {
+                seat.seat.bind_capabilities(
+                    DeviceCapability::PointerAbsolute
+                        | DeviceCapability::Button
+                        | DeviceCapability::Scroll
+                        | DeviceCapability::Keyboard,
+                );
+                let _ = self.connection.flush();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle(&mut self, command: Command) {
+        let delivered = match command {
+            Command::Shutdown => true,
+            Command::MouseMove { x, y } => self.emit::<ei::PointerAbsolute, _>(|pointer| {
+                pointer.motion_absolute(x as f32, y as f32)
+            }),
+            Command::MouseButton {
+                evdev_button,
+                down,
+                x,
+                y,
+            } => {
+                // Place first, then click — a button lands wherever the
+                // pointer currently is, so the two cannot be reordered.
+                self.emit::<ei::PointerAbsolute, _>(|pointer| {
+                    pointer.motion_absolute(x as f32, y as f32)
+                });
+                let state = if down {
+                    ei::button::ButtonState::Press
+                } else {
+                    ei::button::ButtonState::Released
+                };
+                self.emit::<ei::Button, _>(|button| button.button(evdev_button, state))
+            }
+            Command::Scroll { delta_x, delta_y } => {
+                // Both axes in a single request: libei calls a second
+                // scroll_discrete within one frame a client bug and may drop
+                // it or disconnect us. The vertical flip is the same one the
+                // capture side applies going the other way, from Wayland's
+                // positive-is-down to the wire's Windows convention.
+                let (x, y) = scroll_to_ei(delta_x, delta_y);
+                self.emit::<ei::Scroll, _>(|scroll| scroll.scroll_discrete(x, y))
+            }
+            Command::Key { evdev_code, down } => {
+                let state = if down {
+                    ei::keyboard::KeyState::Press
+                } else {
+                    ei::keyboard::KeyState::Released
+                };
+                self.emit::<ei::Keyboard, _>(|keyboard| keyboard.key(evdev_code, state))
+            }
+        };
+
+        if !delivered {
+            // Dropping beats falling back to the relative path here: mixing
+            // the two would leave the fallback's remembered position stale,
+            // and a stale position is exactly the drift this rewrite removes.
+            log::debug!("[wayland] no resumed ei device for the event; dropping");
+        }
+    }
+}
+
+/// Opens the libei sender connection on an already-granted RemoteDesktop
+/// session. Every failure is recoverable — the caller keeps the relative
+/// portal path — so all of them come back as a reason to log, not a panic.
+async fn connect_eis(
+    remote_desktop: &RemoteDesktop<'_>,
+    session: &Session<'_, RemoteDesktop<'_>>,
+) -> Result<(EisSink, reis::tokio::EiConvertEventStream), String> {
+    let fd = remote_desktop
+        .connect_to_eis(session)
+        .await
+        .map_err(|error| format!("ConnectToEIS refused: {error}"))?;
+
+    let stream = UnixStream::from(fd);
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("could not configure the EIS socket: {error}"))?;
+
+    let context =
+        ei::Context::new(stream).map_err(|error| format!("could not create ei context: {error}"))?;
+    let _ = context.flush();
+
+    let (connection, events) = context
+        .handshake_tokio("mykvm", ei::handshake::ContextType::Sender)
+        .await
+        .map_err(|error| format!("ei handshake failed: {error}"))?;
+
+    Ok((
+        EisSink {
+            connection,
+            devices: Vec::new(),
+            sequence: 0,
+            started: Instant::now(),
+        },
+        events,
+    ))
+}
+
+/// Awaits the next libei event, or never, when there is no connection. Lets
+/// the one `select!` below carry an arm that only exists some of the time.
+async fn next_eis_event(
+    events: &mut Option<reis::tokio::EiConvertEventStream>,
+) -> Option<Result<EiEvent, reis::Error>> {
+    match events {
+        Some(events) => events.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn service_loop(
     mut command_rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
     ready: mpsc::Sender<Result<(), String>>,
@@ -217,10 +481,13 @@ async fn service_loop(
     let _ = ready.send(Ok(()));
 
     let mut granted = false;
-    // `None` until the first move/click arrives — the first sample only
-    // establishes an origin, exactly like `last_absolute` on the capture
-    // side; turning it into a delta from zero would fling the cursor.
+    // Only used on the relative fallback path. `None` until the first
+    // move/click arrives — the first sample only establishes an origin,
+    // exactly like `last_absolute` on the capture side; turning it into a
+    // delta from zero would fling the cursor.
     let mut last_position: Option<(f64, f64)> = None;
+    let mut eis: Option<EisSink> = None;
+    let mut eis_events: Option<reis::tokio::EiConvertEventStream> = None;
 
     let start_request = remote_desktop.start(&session, None);
     let mut start_request = std::pin::pin!(start_request);
@@ -239,17 +506,59 @@ async fn service_loop(
                     log::debug!("[wayland] injection not yet permitted; dropping command");
                     continue;
                 }
-                handle_command(&remote_desktop, &session, &mut last_position, command).await;
+                match eis.as_mut() {
+                    Some(eis) => eis.handle(command),
+                    None => {
+                        handle_command(&remote_desktop, &session, &mut last_position, command).await
+                    }
+                }
             }
             result = &mut start_request, if !granted && DENIED.get().is_none() => {
                 match result.and_then(|request| request.response()) {
                     Ok(_selected) => {
                         granted = true;
                         log::info!("[wayland] remote-desktop injection permitted");
+                        // Only now: ConnectToEIS needs a started session.
+                        match connect_eis(&remote_desktop, &session).await {
+                            Ok((sink, events)) => {
+                                log::info!("[wayland] injecting through libei with absolute positioning");
+                                eis = Some(sink);
+                                eis_events = Some(events);
+                            }
+                            Err(error) => {
+                                // Not fatal, but it does mean the cursor will
+                                // drift out of step over time, so say why.
+                                log::warn!(
+                                    "[wayland] no libei connection ({error}); falling back to relative portal motion, which accumulates positional drift"
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         let _ = DENIED.set(format!("RemoteDesktop permission was not granted: {error}"));
                         log::warn!("[wayland] remote-desktop permission refused: {error}");
+                    }
+                }
+            }
+            event = next_eis_event(&mut eis_events) => {
+                match event {
+                    Some(Ok(event)) => {
+                        if let Some(eis) = eis.as_mut() {
+                            eis.apply_lifecycle(&event);
+                        }
+                    }
+                    // The socket closing takes absolute positioning with it.
+                    // Keep the session, drop back to the portal rather than
+                    // going silent.
+                    other => {
+                        if let Some(Err(error)) = other {
+                            log::warn!("[wayland] libei connection failed: {error}");
+                        } else {
+                            log::warn!("[wayland] libei connection closed");
+                        }
+                        eis = None;
+                        eis_events = None;
+                        last_position = None;
                     }
                 }
             }
@@ -259,6 +568,8 @@ async fn service_loop(
     let _ = session.close().await;
 }
 
+/// The relative fallback, used only when the portal backend has no
+/// `ConnectToEIS`. See the module header for why it is second choice.
 async fn handle_command(
     remote_desktop: &RemoteDesktop<'_>,
     session: &Session<'_, RemoteDesktop<'_>>,
@@ -338,6 +649,17 @@ mod tests {
                 assert_eq!(linux_input::evdev_to_windows_vk(picked), Some(vk));
             }
         }
+    }
+
+    #[test]
+    fn scrolling_up_on_the_wire_scrolls_up_in_libei() {
+        // Wheel-up is positive on the wire and negative in libei, and one
+        // notch is 120 there. Getting either wrong inverts or multiplies
+        // every scroll, which is only ever noticed by hand.
+        assert_eq!(scroll_to_ei(0, 1), (0, -120));
+        assert_eq!(scroll_to_ei(0, -3), (0, 360));
+        // Horizontal keeps its sign: right is positive on both sides.
+        assert_eq!(scroll_to_ei(2, 0), (240, 0));
     }
 
     #[test]
