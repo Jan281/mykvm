@@ -60,9 +60,10 @@ fun ColumnScopeAlias.StatusRow(
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Column(modifier = Modifier.padding(end = 12.dp)) {
+        // weight, not SpaceBetween: without it a long line pushes the control
+        // out to the edge instead of wrapping.
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
             Text(label, style = MaterialTheme.typography.bodyMedium)
             Text(
                 text = value,
@@ -87,9 +88,8 @@ fun ColumnScopeAlias.SwitchRow(
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Column(modifier = Modifier.padding(end = 12.dp)) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
             Text(label, style = MaterialTheme.typography.bodyMedium)
             Text(
                 hint,
