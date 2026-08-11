@@ -32,6 +32,7 @@ import {
   readRuntimeStatus,
   relaunchApp,
   requestLanPairing,
+  reloadScreenConfigurations,
   resetPairing,
   restartAsAdmin,
   saveLayout,
@@ -57,7 +58,6 @@ import {
   pixelsToFraction,
   sideLength,
   setAnchorSpan,
-  edgeLinksFromGeometry,
   effectiveEdgeLinks,
   removeLink,
   sideRunsHorizontally,
@@ -1490,13 +1490,12 @@ function App() {
     screen: Screen,
   ) {
     event.preventDefault();
-    // Dragging a screen while wiring its edges would move the very thing being
-    // aimed at, so the rectangles hold still in edge mode.
-    if (boardMode === "edges") {
-      return;
-    }
-    const target = event.currentTarget;
-    target.setPointerCapture(event.pointerId);
+    // Screens are not draggable. Where a display sits is the operating
+    // system's answer, and a second, conflicting arrangement kept here was only
+    // ever a way to disagree with it — which the edge links replaced: they say
+    // what borders what, without pretending to know coordinates. Rearranging is
+    // done in the system's display settings, then pulled in with "reload screen
+    // configurations". A press still selects.
     setSnapshot((current) =>
       current
         ? {
@@ -1509,18 +1508,6 @@ function App() {
           }
         : current,
     );
-    setDragState({
-      pointerId: event.pointerId,
-      screenId: screen.id,
-      originClientX: event.clientX,
-      originClientY: event.clientY,
-      startX: screen.x,
-      startY: screen.y,
-      viewport: {
-        bounds,
-        metrics: boardMetrics,
-      },
-    });
   }
 
   function handleScreenKeyDown(
@@ -1798,6 +1785,28 @@ function App() {
 
     if (machineRole === "client" && !runtime?.started) {
       await setRuntimeState(true);
+    }
+  }
+
+  /**
+   * Pulls the screen configuration back in from the operating system, here and
+   * from every client.
+   *
+   * Positions are the system's to decide, so this replaces editing them by
+   * hand: change the arrangement in the system's display settings, then press
+   * this. Edge links survive it — they are anchored by fractions of a side, not
+   * by coordinates.
+   */
+  async function reloadScreenConfigurationsFromSystem() {
+    setErrorMessage(null);
+    setEdgeNotice(null);
+    try {
+      const nextSnapshot = await reloadScreenConfigurations();
+      if (nextSnapshot) {
+        setSnapshot(nextSnapshot);
+      }
+    } catch (error: unknown) {
+      setErrorMessage(formatUnknownError(error, ui.errors.saveLayout));
     }
   }
 
@@ -2736,13 +2745,7 @@ function App() {
                     type="button"
                     className="secondary-button compact-button"
                     onClick={() => {
-                      setEdgeCuts({});
-                      setPendingAnchor(null);
-                      setEdgeNotice(null);
-                      updateLayout((current) => ({
-                        ...current,
-                        edgeLinks: edgeLinksFromGeometry(current),
-                      }));
+                      void reloadScreenConfigurationsFromSystem();
                     }}
                   >
                     {ui.layout.edgesReset}

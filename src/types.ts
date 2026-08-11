@@ -45,6 +45,8 @@ export interface Screen {
   width: number
   height: number
   scale: number
+  /** How large the screen is drawn in the layout, relative to its resolution. */
+  boardScale?: number
   isPrimary: boolean
 }
 

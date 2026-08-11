@@ -126,8 +126,25 @@ struct Screen {
     y: i32,
     width: i32,
     height: i32,
+    /// The operating system's DPI factor. `width` and `height` are already
+    /// divided by it, so this is informational.
     scale: f64,
+    /// How large this screen is drawn in the layout, relative to its
+    /// resolution.
+    ///
+    /// Deliberately separate from `scale`: that one is the system's, this one
+    /// is the user's. A phone has more pixels than a monitor across a hand's
+    /// width of glass, and drawing it to its resolution makes the layout a poor
+    /// picture of the desk it stands on. Positions come from the operating
+    /// system and are not editable, so this is the one thing about a screen's
+    /// place in the layout that a person decides.
+    #[serde(default = "default_board_scale")]
+    board_scale: f64,
     is_primary: bool,
+}
+
+fn default_board_scale() -> f64 {
+    1.0
 }
 
 /// A stretch of one side of one screen.
@@ -1311,6 +1328,69 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
         )
     })?;
     open_external_path(&log_dir)
+}
+
+/// Re-reads the screen configuration everywhere.
+///
+/// Screen positions belong to the operating system, not to this app, so the
+/// only correct way to change them is to change them there and pull the result
+/// back in. That is what this does: the local displays are read again, and the
+/// screens every client last announced are re-applied.
+///
+/// Clients need no request of their own — they announce their screens every few
+/// seconds anyway, so what discovery already holds is current.
+#[tauri::command]
+fn reload_screen_configurations(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<AppStateSnapshot, String> {
+    {
+        let mut layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+
+        let device_id = layout
+            .devices
+            .iter()
+            .find(|device| device.role == "local")
+            .map(|device| device.id.clone())
+            .unwrap_or_else(|| "local-device".to_string());
+
+        let detected = detect_local_screens(&app, &device_id);
+        if let Some(local) = layout
+            .devices
+            .iter_mut()
+            .find(|device| device.role == "local")
+        {
+            if detected.is_empty() {
+                log::warn!("screen reload found no local displays; keeping what we had");
+            } else {
+                // Carry over the per-screen board scale: it is the user's, not
+                // the operating system's, and re-reading displays must not
+                // silently discard it.
+                let previous = local.screens.clone();
+                local.screens = detected
+                    .into_iter()
+                    .map(|mut screen| {
+                        if let Some(old) =
+                            previous.iter().find(|candidate| candidate.id == screen.id)
+                        {
+                            screen.board_scale = old.board_scale;
+                        }
+                        screen
+                    })
+                    .collect();
+            }
+        }
+
+        write_layout_to_disk(&state.config_path, &layout)?;
+    }
+
+    // Whatever the peers last announced is at most one announce cycle old.
+    sync_layout_peer_presence(&state.layout, &state.peers);
+    log::info!("screen configurations reloaded");
+    Ok(state.snapshot())
 }
 
 #[tauri::command]
@@ -3047,6 +3127,7 @@ pub fn run() {
             read_diagnostic_info,
             open_log_directory,
             save_layout,
+            reload_screen_configurations,
             start_runtime,
             stop_runtime,
             read_clipboard_text,
@@ -4007,6 +4088,7 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
             width: 1,
             height: 1,
             scale: 1.0,
+            board_scale: default_board_scale(),
             is_primary: true,
         }];
     }
@@ -4037,6 +4119,9 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
                 width: logical_size(size.width, raw_scale),
                 height: logical_size(size.height, raw_scale),
                 scale,
+                // Detection knows nothing about how large a screen should be
+                // drawn; the caller carries the user's value over.
+                board_scale: default_board_scale(),
                 is_primary,
             }
         })
@@ -5866,6 +5951,9 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 } else {
                     peer_screen.name.clone()
                 },
+                board_scale: existing_screen
+                    .map(|screen| screen.board_scale)
+                    .unwrap_or_else(default_board_scale),
                 x: existing_screen
                     .map(|screen| screen.x)
                     .unwrap_or(peer_screen.x - peer_min_x),
@@ -6893,6 +6981,7 @@ mod tests {
             width: 1920,
             height: 1080,
             scale: 1.0,
+            board_scale: default_board_scale(),
             is_primary: true,
         }
     }
@@ -7119,6 +7208,7 @@ mod tests {
             width: 1920,
             height: 1200,
             scale: 1.0,
+            board_scale: default_board_scale(),
             is_primary: true,
         }];
         layout.edge_links = Some(vec![EdgeLink {

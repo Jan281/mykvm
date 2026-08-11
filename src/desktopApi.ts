@@ -105,6 +105,21 @@ export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot>
   return invoke<AppStateSnapshot>('save_layout', { layout })
 }
 
+/**
+ * Re-reads the screen configuration from the operating system here, and takes
+ * the screens every client last announced.
+ *
+ * Positions belong to the system, not to this app, so this is the only way they
+ * change: alter them there, then pull the result back in.
+ */
+export async function reloadScreenConfigurations(): Promise<AppStateSnapshot | null> {
+  if (!isTauri()) {
+    return null
+  }
+
+  return invoke<AppStateSnapshot>('reload_screen_configurations')
+}
+
 export async function resetPairing(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {

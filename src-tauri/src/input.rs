@@ -7195,6 +7195,7 @@ mod tests {
             width,
             height,
             scale: 1.0,
+        board_scale: 1.0,
             is_primary: true,
         }
     }
