@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -27,31 +27,31 @@ mod input;
 #[cfg(target_os = "linux")]
 pub mod linux_input;
 mod performance;
-mod quic_transport;
-pub mod shared_input;
+// The wire format and the transport now live in the `mykvm-protocol` crate so
+// the Android client can share them. Re-exported under their old names to keep
+// every call site — and the input-helper crate, which reaches in through
+// `mykvm_lib::shared_input` — working unchanged.
+pub use mykvm_protocol::input as shared_input;
+pub use mykvm_protocol::transport as quic_transport;
+use mykvm_protocol::discovery::{
+    broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
+    normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
+    detect_keyboard_layout, local_peer_id, random_pairing_code, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen,
+    DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
+    TRANSPORT_PORT_MAX,
+};
 #[cfg(target_os = "windows")]
 pub mod windows_input;
 
 use clipboard::{ClipboardContent, ClipboardImage};
 use performance::PerformanceSample;
 
-const DISCOVERY_PORT: u16 = 47833;
-const TRANSPORT_PORT_MIN: u16 = 1024;
-const TRANSPORT_PORT_MAX: u16 = 65_535;
-// A peer that wanted the discovery port but found it taken drifts upward (see
-// `bind_available_udp_port`). We aim discovery traffic at this many consecutive
-// ports starting from the configured base, so two peers that landed on different
-// ports (e.g. 47833 and 47834) still reach each other.
-const DISCOVERY_PORT_SPAN: u16 = 8;
 const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
 const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
-const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.
 const PEER_TTL_MS: u64 = 90_000;
 const MAX_DISCOVERY_PEERS: usize = 128;
-const PAIRING_CODE_TTL_MS: u64 = 60_000;
-const PAIRING_MAX_ATTEMPTS: u8 = 5;
 const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // After we write clipboard content received from a peer, ignore our own
 // clipboard for a short grace window. Reading an image back through the OS
@@ -322,52 +322,6 @@ struct PairedController {
 struct NativeStageStatus {
     state: String,
     detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LanPeer {
-    id: String,
-    name: String,
-    platform: String,
-    #[serde(default)]
-    machine_role: String,
-    #[serde(default)]
-    cluster_id: String,
-    #[serde(default)]
-    pairing_required: bool,
-    host: String,
-    ip: String,
-    #[serde(default = "default_transport_port")]
-    transport_port: u16,
-    #[serde(default)]
-    quic_port: u16,
-    #[serde(default)]
-    transport_public_key: String,
-    #[serde(default = "default_protocol_version")]
-    protocol_version: u16,
-    screen_count: usize,
-    #[serde(default)]
-    input_ready: bool,
-    #[serde(default)]
-    upgrading: bool,
-    #[serde(default)]
-    screens: Vec<LanPeerScreen>,
-    app_version: String,
-    last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LanPeerScreen {
-    id: String,
-    name: String,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    scale: f64,
-    is_primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4298,53 +4252,6 @@ fn probe_local_ip_address() -> Option<String> {
     Some(address.ip().to_string())
 }
 
-fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
-    let mut addresses = Vec::new();
-
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            if interface.is_loopback() {
-                continue;
-            }
-
-            let if_addrs::IfAddr::V4(address) = interface.addr else {
-                continue;
-            };
-            if usable_discovery_ipv4(address.ip) {
-                addresses.push(address.ip);
-            }
-        }
-    }
-
-    if let Some(default_ip) = default_route_ipv4_address() {
-        if usable_discovery_ipv4(default_ip) {
-            addresses.insert(0, default_ip);
-        }
-    }
-
-    addresses.sort_by_key(|address| address.octets());
-    addresses.dedup();
-    addresses
-}
-
-fn default_route_ipv4_address() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let address = socket.local_addr().ok()?;
-    match address.ip() {
-        std::net::IpAddr::V4(ip) => Some(ip),
-        std::net::IpAddr::V6(_) => None,
-    }
-}
-
-fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
-    !address.is_loopback()
-        && !address.is_unspecified()
-        && !address.is_multicast()
-        && !address.is_broadcast()
-        && !address.is_link_local()
-}
-
 fn default_device_source() -> String {
     "manual".into()
 }
@@ -4465,19 +4372,6 @@ fn normalize_modifier_map(map: &ModifierMap) -> ModifierMap {
     }
 }
 
-fn default_transport_port() -> u16 {
-    DISCOVERY_PORT
-}
-
-fn default_protocol_version() -> u16 {
-    quic_transport::PROTOCOL_VERSION
-}
-
-fn preferred_quic_port(discovery_port: u16) -> u16 {
-    discovery_port
-        .saturating_add(1)
-        .clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
-}
 
 fn normalize_input_mode(mode: &str) -> String {
     if mode == "receive" {
@@ -4544,18 +4438,6 @@ fn normalize_transport_port_mode(mode: &str) -> String {
     match mode {
         "fixed" => "fixed".into(),
         _ => "auto".into(),
-    }
-}
-
-fn normalize_transport_port(port: u16) -> u16 {
-    port.clamp(TRANSPORT_PORT_MIN, TRANSPORT_PORT_MAX)
-}
-
-fn normalize_quic_port(discovery_port: u16, quic_port: u16) -> u16 {
-    if quic_port == 0 {
-        preferred_quic_port(discovery_port)
-    } else {
-        normalize_transport_port(quic_port)
     }
 }
 
@@ -5925,22 +5807,6 @@ fn peer_device_id(peer: &LanPeer) -> String {
     }
 }
 
-fn sanitize_id(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.online = true;
     device.input_ready = peer.input_ready;
@@ -6042,22 +5908,6 @@ fn normalize_peer_platform(platform: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoveryPacket {
-    protocol: String,
-    kind: String,
-    peer: LanPeer,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pairing_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pair_cluster_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pair_secret: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pairing_error: Option<String>,
-}
-
 #[derive(Default)]
 struct DiscoveryPairingFields {
     code: Option<String>,
@@ -6111,6 +5961,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
             .map(|device| device.screens.iter().map(screen_to_peer_screen).collect())
             .unwrap_or_default(),
         app_version: env!("CARGO_PKG_VERSION").into(),
+        keyboard_layout: detect_keyboard_layout(),
         last_seen_ms: now_ms(),
     }
 }
@@ -6176,28 +6027,6 @@ fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
         height: screen.height,
         scale: screen.scale,
         is_primary: screen.is_primary,
-    }
-}
-
-fn local_peer_id(host: &str, ip: &str) -> String {
-    let seed = format!("{host}-{ip}");
-    let normalized = seed
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-
-    if normalized.is_empty() {
-        "peer-local".into()
-    } else {
-        format!("peer-{normalized}")
     }
 }
 
@@ -6871,29 +6700,6 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
     format!("UDP {port} is {mode}; {peer_count} LAN peer(s) detected.")
 }
 
-/// Broadcast destinations for discovery, fanned out across the discovery port
-/// span (`base_port ..= base_port + DISCOVERY_PORT_SPAN - 1`). Sending to the
-/// whole span — rather than a single port — lets us reach peers that drifted
-/// onto a neighbouring port when their preferred port was momentarily taken.
-pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
-    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
-}
-
-fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
-    let mut addresses = Vec::new();
-    for port in discovery_target_ports(base_port) {
-        addresses.push(format!("255.255.255.255:{port}"));
-        for ip in local_ips {
-            let [a, b, c, _] = ip.octets();
-            addresses.push(format!("{a}.{b}.{c}.255:{port}"));
-        }
-    }
-
-    addresses.sort();
-    addresses.dedup();
-    addresses
-}
-
 /// Directed discovery destinations for peers we already know about. Pairing and
 /// manual probing use unicast, but the long-running discovery loop used to rely
 /// only on broadcast after that. On LANs where broadcast is flaky or filtered,
@@ -6964,22 +6770,6 @@ fn host_candidates(host_value: &str) -> Vec<String> {
     candidates
 }
 
-/// The consecutive discovery ports we aim traffic at, starting from `base`.
-fn discovery_target_ports(base: u16) -> Vec<u16> {
-    let base = normalize_transport_port(base);
-    let mut ports = Vec::new();
-    for offset in 0..DISCOVERY_PORT_SPAN {
-        let Some(port) = base.checked_add(offset) else {
-            break;
-        };
-        if port > TRANSPORT_PORT_MAX {
-            break;
-        }
-        ports.push(port);
-    }
-    ports
-}
-
 /// The base discovery port peers rendezvous on: the canonical port in auto mode,
 /// or the user's configured port when pinned. Discovery traffic fans out from
 /// here across `DISCOVERY_PORT_SPAN`, independent of whichever port we actually
@@ -6990,37 +6780,6 @@ fn discovery_base_port(layout: &LayoutState) -> u16 {
     } else {
         normalize_transport_port(layout.transport_port)
     }
-}
-
-/// Every other host address in our local /24, used as a fallback when a network
-/// drops broadcast traffic (common with Wi-Fi "AP/client isolation" and some
-/// managed switches) but still forwards unicast between clients.
-pub(crate) fn unicast_sweep_targets(port: u16) -> Vec<String> {
-    unicast_sweep_targets_for_ips(port, &local_ipv4_addresses())
-}
-
-fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
-    let ports = discovery_target_ports(port);
-    let mut targets = Vec::new();
-
-    for ip in local_ips {
-        let [a, b, c, self_host] = ip.octets();
-        let subnet_prefix = format!("{a}.{b}.{c}");
-        targets.extend(
-            (1..=254u8)
-                .filter(|host| *host != self_host)
-                .flat_map(|host| {
-                    let subnet_prefix = subnet_prefix.clone();
-                    ports
-                        .iter()
-                        .map(move |port| format!("{subnet_prefix}.{host}:{port}"))
-                }),
-        );
-    }
-
-    targets.sort();
-    targets.dedup();
-    targets
 }
 
 /// Adds (once per process) an inbound UDP allow rule for this binary to Windows
@@ -7117,18 +6876,12 @@ fn random_hex(byte_count: usize) -> String {
     output
 }
 
-fn random_pairing_code() -> String {
-    let rng = SystemRandom::new();
-    let mut bytes = [0_u8; 4];
-    if rng.fill(&mut bytes).is_err() {
-        bytes = now_ms().to_le_bytes()[..4].try_into().unwrap_or([0; 4]);
-    }
-    format!("{:06}", u32::from_le_bytes(bytes) % 1_000_000)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still name these directly; the production code reads the
+    // port out of the layout and fans out through the protocol crate.
+    use mykvm_protocol::discovery::{DISCOVERY_PORT, DISCOVERY_PORT_SPAN};
 
     fn test_screen(device_id: &str) -> Screen {
         Screen {
@@ -7237,6 +6990,7 @@ mod tests {
                 is_primary: true,
             }],
             app_version: "test".into(),
+            keyboard_layout: String::new(),
             last_seen_ms: now_ms(),
         }
     }
@@ -8224,6 +7978,7 @@ mod tests {
             upgrading: false,
             screens: vec![],
             app_version: "0.1.0".into(),
+            keyboard_layout: String::new(),
             last_seen_ms: now_ms(),
         }];
 
@@ -8342,60 +8097,6 @@ mod tests {
         peer.cluster_id = "other-cluster".into();
 
         assert!(!device_matches_peer(device, &peer, &layout.cluster_id));
-    }
-
-    #[test]
-    fn discovery_target_ports_spans_neighbouring_ports() {
-        let ports = discovery_target_ports(DISCOVERY_PORT);
-        assert_eq!(ports.len(), DISCOVERY_PORT_SPAN as usize);
-        assert_eq!(ports[0], DISCOVERY_PORT);
-        // A peer that drifted from 47833 to 47834 must still be a target.
-        assert!(ports.contains(&(DISCOVERY_PORT + 1)));
-        assert_eq!(
-            *ports.last().unwrap(),
-            DISCOVERY_PORT + DISCOVERY_PORT_SPAN - 1
-        );
-    }
-
-    #[test]
-    fn discovery_target_ports_clamp_near_max() {
-        let ports = discovery_target_ports(TRANSPORT_PORT_MAX - 1);
-        assert_eq!(ports, vec![TRANSPORT_PORT_MAX - 1, TRANSPORT_PORT_MAX]);
-    }
-
-    #[test]
-    fn broadcast_addrs_reach_a_drifted_peer_port() {
-        // The exact failure we are fixing: one peer on 47833 must still address a
-        // peer that landed on 47834, via the global broadcast target.
-        let addrs = broadcast_addrs(DISCOVERY_PORT);
-        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
-        assert!(addrs.contains(&format!("255.255.255.255:{}", DISCOVERY_PORT + 1)));
-    }
-
-    #[test]
-    fn broadcast_addrs_include_every_local_ipv4_subnet() {
-        let addrs = broadcast_addrs_for_ips(
-            DISCOVERY_PORT,
-            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
-        );
-
-        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
-        assert!(addrs.contains(&format!("192.168.66.255:{DISCOVERY_PORT}")));
-        assert!(addrs.contains(&format!("10.0.0.255:{DISCOVERY_PORT}")));
-        assert!(addrs.contains(&format!("192.168.66.255:{}", DISCOVERY_PORT + 1)));
-    }
-
-    #[test]
-    fn unicast_sweep_targets_cover_every_local_ipv4_subnet() {
-        let targets = unicast_sweep_targets_for_ips(
-            DISCOVERY_PORT,
-            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
-        );
-
-        assert!(targets.contains(&format!("192.168.66.92:{DISCOVERY_PORT}")));
-        assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
-        assert!(!targets.contains(&format!("192.168.66.106:{DISCOVERY_PORT}")));
-        assert!(!targets.contains(&format!("10.0.0.4:{DISCOVERY_PORT}")));
     }
 
     #[test]

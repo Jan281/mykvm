@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MyKVM</string>
+    <string name="channel_name">Client running</string>
+    <string name="service_starting">Starting…</string>
+    <string name="service_failed">Could not start: %1$s</string>
+    <string name="action_stop">Stop</string>
+    <string name="needs_accessibility">Enable the accessibility service so clicks work</string>
+    <string name="accessibility_description">Lets MyKVM tap, drag and scroll where the remote pointer is.</string>
+    <string name="needs_keyboard">Select MyKVM as the keyboard so typing works</string>
+    <string name="ime_placeholder">MyKVM keyboard — used for remote typing. Switch keyboards to type with your fingers.</string>
+    <string name="locked">Phone is locked — unlock it for clicks and typing to work</string>
+</resources>

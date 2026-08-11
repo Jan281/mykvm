@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  canPerformGestures is the whole point: it is what lets dispatchGesture turn a
+  remote mouse click into a tap. Without it the service binds and can do nothing.
+
+  We ask for no event types and no content flags beyond what scrolling needs —
+  this service is here to act, not to observe, and requesting less means the
+  system hands us less of the user's screen content.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="100" />

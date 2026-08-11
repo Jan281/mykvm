@@ -1,0 +1,24 @@
+[package]
+name = "mykvm-android-core"
+version = "0.1.0"
+description = "The MyKVM client runtime for Android, exposed to Kotlin through JNI"
+license = "MIT"
+edition = "2021"
+
+# A workspace of its own: the desktop workspace lives in ../../src-tauri and
+# must not try to build this for the host, where the JNI symbols have no
+# counterpart.
+[workspace]
+
+[lib]
+name = "mykvm_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+mykvm-protocol = { path = "../../src-tauri/protocol" }
+jni = "0.21"
+log = "0.4"
+android_logger = "0.15"
+rmp-serde = "1"
+serde = { version = "1.0", features = ["derive"] }
+socket2 = "0.6"
