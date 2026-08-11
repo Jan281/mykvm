@@ -44,6 +44,8 @@ class MainActivity : AppCompatActivity() {
             addView(button("Allow notifications") { requestNotifications() })
             addView(button("Ignore battery optimisation") { requestBatteryExemption() })
             addView(button("Allow drawing over other apps") { requestOverlay() })
+            addView(button("Enable accessibility service") { openAccessibilitySettings() })
+            addView(button("Choose MyKVM as keyboard") { openKeyboardSettings() })
         }
         setContentView(ScrollView(this).apply { addView(column) })
     }
@@ -84,6 +86,8 @@ class MainActivity : AppCompatActivity() {
             NativeCore.nativeStatus(),
             batteryHint(),
             overlayHint(),
+            accessibilityHint(),
+            keyboardHint(),
             warnIfTunnelled(),
         ).joinToString("\n\n")
     }
@@ -124,6 +128,37 @@ class MainActivity : AppCompatActivity() {
                 Uri.parse("package:$packageName"),
             ),
         )
+    }
+
+    /**
+     * Android revokes the accessibility grant on every reinstall — an update
+     * must not inherit rights that powerful — so this is not a one-time step
+     * during development, and the hint has to stay visible.
+     */
+    private fun openAccessibilitySettings() {
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
+    private fun openKeyboardSettings() {
+        startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+    }
+
+    private fun accessibilityHint(): String? {
+        val enabled = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ).orEmpty().contains(packageName)
+        return if (enabled) null
+        else "Accessibility is off; clicks and scrolling do nothing. It is revoked by every reinstall."
+    }
+
+    private fun keyboardHint(): String? {
+        val current = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.DEFAULT_INPUT_METHOD,
+        ).orEmpty()
+        return if (current.contains(packageName)) null
+        else "MyKVM is not the selected keyboard; typing does nothing."
     }
 
     private fun overlayHint(): String? =
