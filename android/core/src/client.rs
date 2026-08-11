@@ -139,6 +139,8 @@ pub struct Client {
     queued: Arc<Mutex<usize>>,
     /// The keyboard layout the controlling machine announced.
     layout: Arc<Mutex<String>>,
+    /// Current screen size. Changes when the phone is rotated.
+    screen: Arc<Mutex<(i32, i32)>>,
 }
 
 impl Client {
@@ -184,6 +186,26 @@ impl Client {
         )
     }
 
+    /// Reports a new screen size, which on a phone means it was rotated.
+    ///
+    /// Width and height swap, and the desktop's layout has to learn that or
+    /// every crossing lands somewhere the screen no longer reaches. Returns
+    /// whether anything actually changed.
+    pub fn set_screen(&self, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        let Ok(mut screen) = self.screen.lock() else {
+            return false;
+        };
+        if *screen == (width, height) {
+            return false;
+        }
+        log::info!("[core] screen is now {width}x{height}");
+        *screen = (width, height);
+        true
+    }
+
     /// The keyboard layout the controlling machine last announced, or empty if
     /// it has not said — an older desktop simply omits the field.
     pub fn keyboard_layout(&self) -> String {
@@ -210,6 +232,7 @@ pub fn start(config: Config) -> Result<Client, String> {
 
     let membership = Arc::new(Mutex::new(Membership::load(&config.identity_dir)));
     let layout = Arc::new(Mutex::new(String::new()));
+    let screen = Arc::new(Mutex::new((config.screen_width, config.screen_height)));
     let challenge = Arc::new(Mutex::new(None));
 
     let transport = start_transport(
@@ -234,6 +257,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         Arc::clone(&challenge),
         Arc::clone(&membership),
         Arc::clone(&layout),
+        Arc::clone(&screen),
     )?;
 
     let quic_port = transport.port();
@@ -250,6 +274,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         membership,
         queued,
         layout,
+        screen,
     })
 }
 
@@ -363,6 +388,7 @@ fn spawn_discovery(
     challenge: Arc<Mutex<Option<Challenge>>>,
     membership: Arc<Mutex<Membership>>,
     layout: Arc<Mutex<String>>,
+    screen: Arc<Mutex<(i32, i32)>>,
 ) -> Result<(), String> {
     let socket = bind_discovery_socket(config.discovery_port)?;
     socket
@@ -374,8 +400,6 @@ fn spawn_discovery(
 
     let base_port = config.discovery_port;
     let name = config.device_name.clone();
-    let width = config.screen_width;
-    let height = config.screen_height;
 
     thread::Builder::new()
         .name("mykvm-discovery".into())
@@ -391,6 +415,10 @@ fn spawn_discovery(
                     .lock()
                     .map(|membership| membership.clone())
                     .unwrap_or_default();
+                let (width, height) = screen
+                    .lock()
+                    .map(|screen| *screen)
+                    .unwrap_or((0, 0));
                 build_peer(
                     &device_id, &name, &ip, base_port, &transport, width, height, &joined,
                 )

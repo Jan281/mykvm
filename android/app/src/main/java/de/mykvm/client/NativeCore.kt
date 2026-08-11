@@ -34,6 +34,9 @@ object NativeCore {
     /** The layout the controlling machine types on, e.g. "us(intl)". */
     external fun nativeKeyboardLayout(): String
 
+    /** Reports a new screen size, which on a phone means it was rotated. */
+    external fun nativeSetScreen(width: Int, height: Int)
+
     const val KIND_MOUSE_MOVE = 1
     const val KIND_MOUSE_BUTTON = 2
     const val KIND_SCROLL = 3

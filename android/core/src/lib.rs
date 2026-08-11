@@ -144,6 +144,23 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativePairingCode(
     to_java_string(&env, &code)
 }
 
+/// Reports a new screen size after a rotation. Announcing is on a timer, so
+/// nothing has to be pushed — the next announce simply carries the new size.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeSetScreen(
+    _env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+) {
+    let Ok(slot) = CLIENT.lock() else {
+        return;
+    };
+    if let Some(running) = slot.as_ref() {
+        running.set_screen(width, height);
+    }
+}
+
 /// The keyboard layout the controlling machine announced, or empty. The client
 /// applies it rather than guessing, since a phone has no layout of its own for
 /// injected keys.

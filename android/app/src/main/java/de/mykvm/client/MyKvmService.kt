@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
+import android.hardware.display.DisplayManager
+import android.view.Display
+import android.view.WindowManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
@@ -56,12 +60,12 @@ class MyKvmService : Service() {
             }
         }
 
-        val metrics = resources.displayMetrics
+        val (width, height) = screenSize()
         val error = NativeCore.nativeStart(
             Build.MODEL ?: "Android",
             DISCOVERY_PORT,
-            metrics.widthPixels,
-            metrics.heightPixels,
+            width,
+            height,
             filesDir.absolutePath,
         )
 
@@ -74,12 +78,64 @@ class MyKvmService : Service() {
         }
 
         events = CoreEvents { kind, p1, p2 -> onInput(kind, p1, p2) }.also { it.start() }
+        getSystemService(DisplayManager::class.java)?.registerDisplayListener(displays, null)
         updateNotification()
         // START_STICKY: if Android reclaims us under memory pressure, come back.
         return START_STICKY
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        reportScreenSize()
+    }
+
+    /**
+     * Watches for rotation.
+     *
+     * A service is not a UI context, so its configuration callback is not a
+     * dependable signal for this — the display listener is. Rotating swaps
+     * width and height, and the desktop's layout has to learn that or a
+     * crossing keeps aiming at an edge that no longer exists.
+     */
+    private val displays = object : DisplayManager.DisplayListener {
+        override fun onDisplayChanged(displayId: Int) = reportScreenSize()
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+    }
+
+    /**
+     * The real size of the screen right now.
+     *
+     * Deliberately not `resources.displayMetrics`: a service holds an
+     * application context, whose metrics do not follow rotation, so that would
+     * report the startup size forever.
+     */
+    private fun screenSize(): Pair<Int, Int> {
+        val display = getSystemService(DisplayManager::class.java)
+            ?.getDisplay(Display.DEFAULT_DISPLAY)
+            ?: return resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+
+        // A *window* context, not merely a display context: metrics from a
+        // non-UI context are documented as unreliable, and that is exactly the
+        // trap here — it would keep reporting the size at startup.
+        val bounds = createDisplayContext(display)
+            .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
+            .getSystemService(WindowManager::class.java)
+            .currentWindowMetrics
+            .bounds
+        return bounds.width() to bounds.height()
+    }
+
+    private fun reportScreenSize() {
+        val (width, height) = screenSize()
+        // Logged on arrival rather than on change: a callback that never fires
+        // and a size that never changes look identical from the core's log.
+        Log.d(TAG, "display reports ${width}x$height")
+        NativeCore.nativeSetScreen(width, height)
+    }
+
     override fun onDestroy() {
+        getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(displays)
         idle.removeCallbacks(hideCursor)
         cursor?.hide()
         cursor = null
