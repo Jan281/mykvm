@@ -1462,21 +1462,44 @@ function App() {
 
   function boardRect(screen: Screen) {
     const size = boardScaleOf(screen);
+    const centre = deviceCentre(screen.deviceId) ?? {
+      x: screen.x + screen.width / 2,
+      y: screen.y + screen.height / 2,
+    };
+
     const width = screen.width * size;
     const height = screen.height * size;
+    // Positions move towards the block's centre by the same factor the sizes
+    // shrink. Scaling each rectangle around its own middle instead would leave
+    // the gaps between a machine's monitors at full size, and the block would
+    // fall apart into scattered fragments rather than becoming a smaller
+    // version of itself.
+    const x = centre.x + (screen.x - centre.x) * size;
+    const y = centre.y + (screen.y - centre.y) * size;
 
     return {
       left:
         boardViewport.metrics.offsetX +
-        (screen.x - boardViewport.bounds.minX + (screen.width - width) / 2) *
-          boardViewport.metrics.scale,
+        (x - boardViewport.bounds.minX) * boardViewport.metrics.scale,
       top:
         boardViewport.metrics.offsetY +
-        (screen.y - boardViewport.bounds.minY + (screen.height - height) / 2) *
-          boardViewport.metrics.scale,
+        (y - boardViewport.bounds.minY) * boardViewport.metrics.scale,
       width: width * boardViewport.metrics.scale,
       height: height * boardViewport.metrics.scale,
     };
+  }
+
+  /** The middle of a device's block of screens, which scaling pivots around. */
+  function deviceCentre(deviceId: string) {
+    const owned = screens.filter((screen) => screen.deviceId === deviceId);
+    if (owned.length === 0) {
+      return null;
+    }
+    const minX = Math.min(...owned.map((screen) => screen.x));
+    const minY = Math.min(...owned.map((screen) => screen.y));
+    const maxX = Math.max(...owned.map((screen) => screen.x + screen.width));
+    const maxY = Math.max(...owned.map((screen) => screen.y + screen.height));
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
   }
 
   /** A screen written before this setting existed simply draws full size. */
