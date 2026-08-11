@@ -1490,12 +1490,13 @@ function App() {
     screen: Screen,
   ) {
     event.preventDefault();
-    // Screens are not draggable. Where a display sits is the operating
-    // system's answer, and a second, conflicting arrangement kept here was only
-    // ever a way to disagree with it — which the edge links replaced: they say
-    // what borders what, without pretending to know coordinates. Rearranging is
-    // done in the system's display settings, then pulled in with "reload screen
-    // configurations". A press still selects.
+    // Dragging a screen while wiring its edges would move the very thing being
+    // aimed at, so the rectangles hold still in edge mode.
+    if (boardMode === "edges") {
+      return;
+    }
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
     setSnapshot((current) =>
       current
         ? {
@@ -1508,6 +1509,20 @@ function App() {
           }
         : current,
     );
+    // The whole device follows: a machine's monitors sit where its own system
+    // put them, and only the block's place among the others is ours to choose.
+    setDragState({
+      pointerId: event.pointerId,
+      screenId: screen.id,
+      originClientX: event.clientX,
+      originClientY: event.clientY,
+      startX: screen.x,
+      startY: screen.y,
+      viewport: {
+        bounds,
+        metrics: boardMetrics,
+      },
+    });
   }
 
   function handleScreenKeyDown(

@@ -144,19 +144,48 @@ function screenOverlapArea(a: Screen, b: Screen) {
   return width > 0 && height > 0 ? width * height : 0
 }
 
+/**
+ * Moves a whole device by the offset that would put one of its screens at
+ * `nextPosition`.
+ *
+ * A device's monitors sit where its operating system arranged them, and that
+ * arrangement is not ours to edit — dragging one screen out of its own desktop
+ * would describe a machine that does not exist. What a person does decide is
+ * where that machine sits relative to the others, so the whole block moves
+ * together and keeps its internal shape.
+ */
 export function moveScreen(
   layout: LayoutState,
   screenId: string,
   nextPosition: ScreenPosition,
 ): LayoutState {
+  const dragged = layout.devices
+    .flatMap((device) => device.screens)
+    .find((screen) => screen.id === screenId)
+  if (!dragged) {
+    return layout
+  }
+
+  const offsetX = nextPosition.x - dragged.x
+  const offsetY = nextPosition.y - dragged.y
+  if (offsetX === 0 && offsetY === 0) {
+    return layout
+  }
+
   return {
     ...layout,
-    devices: layout.devices.map((device) => ({
-      ...device,
-      screens: device.screens.map((screen) =>
-        screen.id === screenId ? { ...screen, ...nextPosition } : screen,
-      ),
-    })),
+    devices: layout.devices.map((device) =>
+      device.screens.some((screen) => screen.id === screenId)
+        ? {
+            ...device,
+            screens: device.screens.map((screen) => ({
+              ...screen,
+              x: screen.x + offsetX,
+              y: screen.y + offsetY,
+            })),
+          }
+        : device,
+    ),
   }
 }
 
@@ -170,7 +199,11 @@ export function snapScreenPosition(
     return nextPosition
   }
 
-  const screens = flattenScreens(layout).filter((screen) => screen.id !== screenId)
+  // Every screen of the dragged device moves with it, so snapping against a
+  // sibling would be snapping against something that is not standing still.
+  const screens = flattenScreens(layout).filter(
+    (screen) => screen.deviceId !== movingScreen.deviceId,
+  )
 
   return {
     x: snapAxis(
