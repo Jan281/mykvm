@@ -181,6 +181,7 @@ export const TEXT = {
       edgesSplitBlocked: "该段已连接，请先断开再分割。",
       edgesUnlink: "断开",
       reloadScreens: "重新加载屏幕配置",
+      reloadScreensHint: "屏幕位置由各自的操作系统决定。在系统显示设置中调整后，用这里重新读取。",
       edgesClear: "全部清除",
       edgesPending: "已选择：",
       edgesUnlinked: "未连接",
@@ -436,6 +437,8 @@ export const TEXT = {
       edgesSplitBlocked: "That stretch is linked — unlink it before splitting.",
       edgesUnlink: "Unlink",
       reloadScreens: "Reload screen configurations",
+      reloadScreensHint:
+        "Screen positions come from each machine's own system. Change them in its display settings, then read them back in here.",
       edgesClear: "Clear all",
       edgesPending: "Selected:",
       edgesUnlinked: "Not linked",
@@ -694,6 +697,8 @@ export const TEXT = {
       edgesSplitBlocked: "Dieses Stück ist verbunden — erst trennen, dann teilen.",
       edgesUnlink: "Trennen",
       reloadScreens: "Bildschirmkonfiguration neu laden",
+      reloadScreensHint:
+        "Die Bildschirmpositionen gibt das jeweilige Betriebssystem vor. Dort ändern, dann hier neu einlesen.",
       edgesClear: "Alle entfernen",
       edgesPending: "Ausgewählt:",
       edgesUnlinked: "Nicht verbunden",
