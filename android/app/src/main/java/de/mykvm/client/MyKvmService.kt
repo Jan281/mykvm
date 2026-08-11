@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.accessibilityservice.AccessibilityService
 import android.app.KeyguardManager
 import android.hardware.display.DisplayManager
 import android.os.PowerManager
@@ -190,7 +191,18 @@ class MyKvmService : Service() {
      */
     private var modifiers = MyKvmInputMethod.Modifiers()
 
+    /**
+     * True while a Windows key is held and nothing has been pressed with it.
+     *
+     * Tapping it alone should go home, the way it opens the launcher on a
+     * desktop — but Win+L has to stay a shortcut. So the decision waits for the
+     * release, and any key in between cancels it.
+     */
+    private var windowsKeyAlone = false
+
     private fun onKey(vk: Int, down: Boolean) {
+        if (handleSystemKey(vk, down)) return
+
         if (KeyMap.isModifier(vk)) {
             modifiers = when (vk) {
                 0x10, 0xA0, 0xA1 -> modifiers.copy(shift = down)
@@ -237,6 +249,57 @@ class MyKvmService : Service() {
         }
         Log.i(TAG, "typing as $layout, announced as '$announced'")
         MyKvmInputMethod.layout = layout
+    }
+
+    /**
+     * Keys that act on the system rather than on a text field.
+     *
+     * Returns whether the key was consumed here. Without this, none of them
+     * would do anything at all while the notification shade is open: there is
+     * no focused field then, so the input method has nowhere to type.
+     */
+    private fun handleSystemKey(vk: Int, down: Boolean): Boolean {
+        if (vk == VK_LWIN || vk == VK_RWIN) {
+            if (down) {
+                windowsKeyAlone = true
+            } else if (windowsKeyAlone) {
+                windowsKeyAlone = false
+                performGlobal(AccessibilityService.GLOBAL_ACTION_HOME, "home")
+            }
+            return true
+        }
+
+        // Anything pressed while the Windows key is held is a combination, not
+        // a tap on the key itself.
+        if (down && windowsKeyAlone && !KeyMap.isModifier(vk)) {
+            windowsKeyAlone = false
+            when (vk) {
+                VK_L -> {
+                    performGlobal(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN, "lock")
+                    return true
+                }
+                VK_TAB -> {
+                    performGlobal(AccessibilityService.GLOBAL_ACTION_RECENTS, "recents")
+                    return true
+                }
+            }
+            return false
+        }
+
+        // Escape is the key people reach for to get out of whatever is on
+        // screen, and back is what does that on Android — including closing the
+        // notification shade.
+        if (vk == VK_ESCAPE) {
+            if (down) performGlobal(AccessibilityService.GLOBAL_ACTION_BACK, "back")
+            return true
+        }
+
+        return false
+    }
+
+    private fun performGlobal(action: Int, name: String) {
+        val hands = reachOrWarn() ?: return
+        if (!hands.global(action)) Log.w(TAG, "$name was refused")
     }
 
     private var warnedAboutKeyboard = false
@@ -432,6 +495,11 @@ class MyKvmService : Service() {
         // Ordinals from the core's flatten(): Left, Right, Middle, Back, Forward.
         private const val BUTTON_LEFT = 0
         private const val BUTTON_RIGHT = 1
+        private const val VK_TAB = 0x09
+        private const val VK_ESCAPE = 0x1B
+        private const val VK_L = 0x4C
+        private const val VK_LWIN = 0x5B
+        private const val VK_RWIN = 0x5C
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, MyKvmService::class.java))

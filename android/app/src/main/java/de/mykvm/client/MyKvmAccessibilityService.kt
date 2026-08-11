@@ -43,6 +43,17 @@ class MyKvmAccessibilityService : AccessibilityService() {
 
     fun scroll(x: Int, y: Int, notches: Int) = actions?.scroll(x, y, notches)
 
+    /**
+     * Performs one of the system-wide actions.
+     *
+     * These reach places a dispatched gesture cannot address by coordinate —
+     * the notification shade closes, the launcher comes forward — and they work
+     * regardless of what has focus. That matters here because with the shade
+     * open there is no text field at all, so the normal key path has nowhere to
+     * go.
+     */
+    fun global(action: Int): Boolean = performGlobalAction(action)
+
     companion object {
         @Volatile
         var instance: MyKvmAccessibilityService? = null
