@@ -50,6 +50,18 @@
                 android:resource="@xml/accessibility_service" />
         </service>
 
+        <service
+            android:name=".MyKvmInputMethod"
+            android:exported="true"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/input_method" />
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

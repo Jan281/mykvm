@@ -107,9 +107,49 @@ class MyKvmService : Service() {
             // convention the Windows receiver uses.
             NativeCore.KIND_SCROLL -> reachOrWarn()?.scroll(pointerX, pointerY, p2)
 
-            // Keys are step 8, over the input method.
+            NativeCore.KIND_KEY -> onKey(vk = p1, down = p2 != 0)
+
             else -> Log.i(TAG, "input kind=$kind p1=$p1 p2=$p2")
         }
+    }
+
+    /**
+     * Modifiers are tracked here rather than in the input method, because they
+     * have to survive the input method being torn down and rebuilt — Android
+     * recreates it freely, and a Shift that went down before that would
+     * otherwise stay stuck.
+     */
+    private var modifiers = MyKvmInputMethod.Modifiers()
+
+    private fun onKey(vk: Int, down: Boolean) {
+        if (KeyMap.isModifier(vk)) {
+            modifiers = when (vk) {
+                0x10, 0xA0, 0xA1 -> modifiers.copy(shift = down)
+                0x11, 0xA2, 0xA3 -> modifiers.copy(ctrl = down)
+                0x12, 0xA4 -> modifiers.copy(alt = down)
+                // Right Alt is AltGr on a German keyboard, and that is a
+                // different thing from Alt: it produces characters.
+                0xA5 -> modifiers.copy(altGr = down)
+                else -> modifiers
+            }
+            return
+        }
+
+        val keyboard = MyKvmInputMethod.instance
+        if (keyboard == null) {
+            warnNoKeyboard()
+            return
+        }
+        keyboard.onRemoteKey(vk, down, modifiers)
+    }
+
+    private var warnedAboutKeyboard = false
+
+    private fun warnNoKeyboard() {
+        if (warnedAboutKeyboard) return
+        warnedAboutKeyboard = true
+        Log.w(TAG, "MyKVM is not the selected keyboard; typing does nothing")
+        updateNotification(getString(R.string.needs_keyboard))
     }
 
     /**

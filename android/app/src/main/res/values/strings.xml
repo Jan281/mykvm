@@ -7,4 +7,6 @@
     <string name="action_stop">Stop</string>
     <string name="needs_accessibility">Enable the accessibility service so clicks work</string>
     <string name="accessibility_description">Lets MyKVM tap, drag and scroll where the remote pointer is.</string>
+    <string name="needs_keyboard">Select MyKVM as the keyboard so typing works</string>
+    <string name="ime_placeholder">MyKVM keyboard — used for remote typing. Switch keyboards to type with your fingers.</string>
 </resources>
