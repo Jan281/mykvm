@@ -107,6 +107,8 @@ pub struct Client {
     peers_seen: Arc<Mutex<Vec<String>>>,
     challenge: Arc<Mutex<Option<Challenge>>>,
     membership: Arc<Mutex<Membership>>,
+    /// How many events are enqueued but not yet polled.
+    queued: Arc<Mutex<usize>>,
 }
 
 impl Client {
@@ -118,7 +120,12 @@ impl Client {
     pub fn poll(&self, timeout: Duration) -> Option<InputEvent> {
         let events = self.events.lock().ok()?;
         match events.recv_timeout(timeout) {
-            Ok(event) => Some(event),
+            Ok(event) => {
+                // Releasing the slot is what makes the depth counter a measure
+                // of backlog rather than of everything ever received.
+                release_slot(&self.queued);
+                Some(event)
+            }
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => None,
         }
@@ -203,6 +210,7 @@ pub fn start(config: Config) -> Result<Client, String> {
         peers_seen,
         challenge,
         membership,
+        queued,
     })
 }
 
@@ -247,12 +255,9 @@ fn start_transport(
             return;
         }
 
-        if let Ok(mut depth) = queued.lock() {
-            if *depth >= MAX_QUEUED_EVENTS {
-                log::warn!("[core] event queue full; dropping input");
-                return;
-            }
-            *depth += 1;
+        if !reserve_slot(&queued) {
+            log::warn!("[core] event queue full; dropping input");
+            return;
         }
 
         if events.send(packet.event).is_err() {
@@ -692,6 +697,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Claims one place in the queue, refusing once the consumer is this far
+/// behind. Paired with [`release_slot`] — an unreleased slot is a leak that
+/// eventually wedges the queue shut for good.
+fn reserve_slot(queued: &Mutex<usize>) -> bool {
+    let Ok(mut depth) = queued.lock() else {
+        return false;
+    };
+    if *depth >= MAX_QUEUED_EVENTS {
+        return false;
+    }
+    *depth += 1;
+    true
+}
+
+fn release_slot(queued: &Mutex<usize>) {
+    if let Ok(mut depth) = queued.lock() {
+        *depth = depth.saturating_sub(1);
+    }
+}
+
 /// Flattens an event into the three integers the JNI layer hands to Kotlin.
 ///
 /// A phone has exactly one screen, so `MouseMove`'s screen id carries no
@@ -730,6 +755,28 @@ pub const KIND_KEY: i32 = 4;
 mod tests {
     use super::*;
     use mykvm_protocol::input::MouseButton;
+
+    #[test]
+    fn a_polled_event_frees_its_place_in_the_queue() {
+        // The first version only ever counted up, so after MAX_QUEUED_EVENTS
+        // arrivals every further event was dropped forever — input worked for
+        // exactly 512 mouse moves and then stopped dead.
+        let queued = Mutex::new(0usize);
+        for _ in 0..MAX_QUEUED_EVENTS {
+            assert!(reserve_slot(&queued));
+        }
+        assert!(!reserve_slot(&queued), "queue should be full");
+
+        release_slot(&queued);
+        assert!(reserve_slot(&queued), "a polled event must free its slot");
+    }
+
+    #[test]
+    fn releasing_more_than_was_reserved_does_not_wrap_around() {
+        let queued = Mutex::new(0usize);
+        release_slot(&queued);
+        assert_eq!(*queued.lock().unwrap(), 0);
+    }
 
     #[test]
     fn events_flatten_into_the_shape_kotlin_expects() {
