@@ -2833,7 +2833,7 @@ function App() {
                 <p className="edge-editor-hint">
                   {selectedScreen
                     ? `${ui.layout.boardScale}: ${selectedScreen.name} — ${ui.layout.dragHint}`
-                    : ui.layout.reloadScreensHint}
+                    : `${ui.layout.reloadScreensHint} ${ui.layout.dragHint}`}
                 </p>
                 <div className="edge-editor-actions">
                   {selectedScreen ? (
