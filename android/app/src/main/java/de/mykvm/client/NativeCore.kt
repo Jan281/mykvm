@@ -18,6 +18,7 @@ object NativeCore {
         screenWidth: Int,
         screenHeight: Int,
         identityDir: String,
+        verbose: Boolean,
     ): String
 
     /** `[kind, p1, p2]`, or null if nothing arrived within the timeout. */

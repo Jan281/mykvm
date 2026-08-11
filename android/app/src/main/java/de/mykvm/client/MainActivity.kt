@@ -9,178 +9,333 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
-import android.provider.Settings
-import android.util.Log
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
+import android.provider.Settings as AndroidSettings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import de.mykvm.client.ui.MyKvmTheme
+import de.mykvm.client.ui.Section
+import de.mykvm.client.ui.StatusRow
+import de.mykvm.client.ui.SwitchRow
+import kotlinx.coroutines.delay
 
 /**
- * The setup screen.
+ * The window onto the client: what it is doing, what it still needs, and the
+ * handful of settings that mean anything on a phone.
  *
- * It starts and stops the service and walks the user through the system
- * switches Android will not grant an app on its own. Everything it shows is
- * read from the core, which lives in the service's process — so this window can
- * be destroyed and reopened without disturbing anything.
+ * Everything shown is read from the core in the service's process, so this can
+ * be destroyed and reopened without disturbing the connection.
  */
-class MainActivity : AppCompatActivity() {
-    private lateinit var status: TextView
+class MainActivity : ComponentActivity() {
+    private lateinit var settings: Settings
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        settings = Settings(this)
 
-        status = TextView(this).apply { setPadding(0, 0, 0, 32) }
+        setContent {
+            var theme by remember { mutableStateOf(settings.theme) }
+            val dark = when (theme) {
+                Settings.Theme.DARK -> true
+                Settings.Theme.LIGHT -> false
+                Settings.Theme.SYSTEM -> isSystemInDarkTheme()
+            }
 
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 96, 48, 48)
-            addView(status)
-            addView(button("Start") { MyKvmService.start(this@MainActivity) })
-            addView(button("Stop") { MyKvmService.stop(this@MainActivity) })
-            addView(button("Allow notifications") { requestNotifications() })
-            addView(button("Ignore battery optimisation") { requestBatteryExemption() })
-            addView(button("Allow drawing over other apps") { requestOverlay() })
-            addView(button("Enable accessibility service") { openAccessibilitySettings() })
-            addView(button("Choose MyKVM as keyboard") { openKeyboardSettings() })
-        }
-        setContentView(ScrollView(this).apply { addView(column) })
-    }
-
-    override fun onResume() {
-        super.onResume()
-        status.post(refresh)
-    }
-
-    override fun onPause() {
-        status.removeCallbacks(refresh)
-        super.onPause()
-    }
-
-    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
-        text = label
-        setOnClickListener { onClick() }
-    }
-
-    /**
-     * Redraws once a second while the window is open.
-     *
-     * The pairing code appears when the desktop asks for it and expires on its
-     * own, so it has to show up without the user tapping anything — at that
-     * moment they are looking at the desktop, not at the phone.
-     */
-    private val refresh = object : Runnable {
-        override fun run() {
-            showStatus()
-            status.postDelayed(this, 1000)
+            MyKvmTheme(dark = dark) {
+                Surface(
+                    color = MaterialTheme.colorScheme.background,
+                    modifier = Modifier.fillMaxSize(),
+                ) {
+                    Screen(theme = theme, onTheme = {
+                        settings.theme = it
+                        theme = it
+                    })
+                }
+            }
         }
     }
 
-    private fun showStatus() {
-        val code = NativeCore.nativePairingCode()
-        status.text = listOfNotNull(
-            if (code.isEmpty()) null else "Pairing code: $code",
-            NativeCore.nativeStatus(),
-            batteryHint(),
-            overlayHint(),
-            accessibilityHint(),
-            keyboardHint(),
-            warnIfTunnelled(),
-        ).joinToString("\n\n")
+    @Composable
+    private fun Screen(theme: Settings.Theme, onTheme: (Settings.Theme) -> Unit) {
+        // The pairing code appears when the desktop asks and expires on its
+        // own, so the screen keeps itself current — at that moment the user is
+        // looking at the desktop, not here.
+        var tick by remember { mutableStateOf(0) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(1000)
+                tick++
+            }
+        }
+
+        val status = remember(tick) { NativeCore.nativeStatus() }
+        val code = remember(tick) { NativeCore.nativePairingCode() }
+        val announced = remember(tick) { NativeCore.nativeKeyboardLayout() }
+        val running = status != "stopped"
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // Without this the title sits under the status bar and the last
+                // card under the navigation bar.
+                .safeDrawingPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+        ) {
+            Text(
+                "MyKVM",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+
+            if (code.isNotEmpty()) {
+                Section("Pairing") {
+                    StatusRow("Type this on the desktop", code)
+                }
+            }
+
+            Section("Connection") {
+                StatusRow("Client", if (running) status else "stopped", ok = running)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(onClick = { MyKvmService.start(this@MainActivity) }) { Text("Start") }
+                    OutlinedButton(onClick = { MyKvmService.stop(this@MainActivity) }) {
+                        Text("Stop")
+                    }
+                }
+                warnIfTunnelled()?.let { StatusRow("Network", it, ok = false) }
+            }
+
+            PermissionsSection()
+            SettingsSection(theme, onTheme, announced)
+        }
     }
+
+    @Composable
+    private fun PermissionsSection() = Section("Permissions") {
+        val notifications = hasNotificationPermission()
+        StatusRow(
+            "Notifications",
+            if (notifications) "granted" else "needed for the running client",
+            ok = notifications,
+            actionLabel = if (notifications) null else "Grant",
+            onAction = { requestNotifications() },
+        )
+
+        val overlay = AndroidSettings.canDrawOverlays(this@MainActivity)
+        StatusRow(
+            "Draw over other apps",
+            if (overlay) "granted" else "the pointer stays invisible without it",
+            ok = overlay,
+            actionLabel = if (overlay) null else "Grant",
+            onAction = { openOverlaySettings() },
+        )
+
+        val accessibility = hasAccessibility()
+        StatusRow(
+            "Accessibility",
+            if (accessibility) "granted"
+            else "clicks and scrolling do nothing — revoked by every reinstall",
+            ok = accessibility,
+            actionLabel = if (accessibility) null else "Open settings",
+            onAction = {
+                startActivity(Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS))
+            },
+        )
+
+        val keyboard = isSelectedKeyboard()
+        StatusRow(
+            "Keyboard",
+            if (keyboard) "MyKVM is selected" else "typing does nothing until MyKVM is picked",
+            ok = keyboard,
+            actionLabel = if (keyboard) null else "Open settings",
+            onAction = {
+                startActivity(Intent(AndroidSettings.ACTION_INPUT_METHOD_SETTINGS))
+            },
+        )
+
+        val battery = isBatteryExempt()
+        StatusRow(
+            "Battery optimisation",
+            if (battery) "exempt" else "the client may be stopped in the background",
+            ok = battery,
+            actionLabel = if (battery) null else "Exempt",
+            onAction = { requestBatteryExemption() },
+        )
+    }
+
+    @Composable
+    private fun SettingsSection(
+        theme: Settings.Theme,
+        onTheme: (Settings.Theme) -> Unit,
+        announced: String,
+    ) {
+        var name by remember { mutableStateOf(settings.deviceName) }
+        var port by remember { mutableStateOf(settings.discoveryPort.toString()) }
+        var cursor by remember { mutableStateOf(settings.showCursor) }
+        var verbose by remember { mutableStateOf(settings.verboseLogging) }
+        var paired by remember { mutableStateOf(MyKvmService.isPaired(this)) }
+
+        Section("Settings") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Settings.Theme.entries.forEach { option ->
+                    FilterChip(
+                        selected = theme == option,
+                        onClick = { onTheme(option) },
+                        label = {
+                            Text(option.name.lowercase().replaceFirstChar { it.uppercase() })
+                        },
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = name,
+                onValueChange = {
+                    name = it
+                    settings.deviceName = it
+                },
+                label = { Text("Device name") },
+                supportingText = {
+                    Text("Shown on the desktop. It feeds the peer id, so changing it means pairing again.")
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            OutlinedTextField(
+                value = port,
+                onValueChange = { typed ->
+                    port = typed.filter(Char::isDigit).take(5)
+                    port.toIntOrNull()?.let { settings.discoveryPort = it }
+                },
+                label = { Text("Discovery port") },
+                supportingText = { Text("Must match the desktop. 47833 unless you changed it there.") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            SwitchRow(
+                label = "Show pointer",
+                hint = "Turn off for a phone you only type on",
+                checked = cursor,
+                onChange = {
+                    cursor = it
+                    settings.showCursor = it
+                },
+            )
+
+            SwitchRow(
+                label = "Verbose logging",
+                hint = "Debug detail in logcat, for tracking something down",
+                checked = verbose,
+                onChange = {
+                    verbose = it
+                    settings.verboseLogging = it
+                },
+            )
+
+            StatusRow(
+                "Keyboard layout",
+                if (announced.isEmpty()) "not announced yet — using the built-in default"
+                else "$announced, from the controlling machine",
+            )
+
+            StatusRow(
+                "Pairing",
+                if (paired) "paired" else "not paired",
+                ok = paired,
+                actionLabel = if (paired) "Forget" else null,
+                onAction = {
+                    MyKvmService.forgetPairing(this@MainActivity)
+                    MyKvmService.stop(this@MainActivity)
+                    paired = false
+                },
+            )
+
+            Text(
+                "The name and port take effect when the client is restarted.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    private fun hasNotificationPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
 
     private fun requestNotifications() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
         ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
     }
 
-    /**
-     * Android will otherwise put the service to sleep after a while of screen-
-     * off, and the phone silently drops out of the cluster.
-     */
-    private fun requestBatteryExemption() {
-        if (isBatteryExempt()) return
+    private fun openOverlaySettings() {
         startActivity(
             Intent(
-                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:$packageName"),
             ),
         )
     }
 
-    /**
-     * The pointer lives in a window over other apps, which Android only grants
-     * from its own settings screen — there is no in-app dialog for it.
-     */
-    private fun requestOverlay() {
-        if (Settings.canDrawOverlays(this)) return
-        startActivity(
-            Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName"),
-            ),
-        )
-    }
-
-    /**
-     * Android revokes the accessibility grant on every reinstall — an update
-     * must not inherit rights that powerful — so this is not a one-time step
-     * during development, and the hint has to stay visible.
-     */
-    private fun openAccessibilitySettings() {
-        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-    }
-
-    private fun openKeyboardSettings() {
-        startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
-    }
-
-    private fun accessibilityHint(): String? {
-        val enabled = Settings.Secure.getString(
+    private fun hasAccessibility(): Boolean =
+        AndroidSettings.Secure.getString(
             contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            AndroidSettings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
         ).orEmpty().contains(packageName)
-        return if (enabled) null
-        else "Accessibility is off; clicks and scrolling do nothing. It is revoked by every reinstall."
-    }
 
-    private fun keyboardHint(): String? {
-        val current = Settings.Secure.getString(
+    private fun isSelectedKeyboard(): Boolean =
+        AndroidSettings.Secure.getString(
             contentResolver,
-            Settings.Secure.DEFAULT_INPUT_METHOD,
-        ).orEmpty()
-        return if (current.contains(packageName)) null
-        else "MyKVM is not the selected keyboard; typing does nothing."
-    }
-
-    private fun overlayHint(): String? =
-        if (Settings.canDrawOverlays(this)) null
-        else "Drawing over other apps is off; the pointer stays invisible."
+            AndroidSettings.Secure.DEFAULT_INPUT_METHOD,
+        ).orEmpty().contains(packageName)
 
     private fun isBatteryExempt(): Boolean =
         getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
 
-    private fun batteryHint(): String? =
-        if (isBatteryExempt()) null else "Battery optimisation is on; the client may be stopped in the background."
+    private fun requestBatteryExemption() {
+        startActivity(
+            Intent(
+                AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName"),
+            ),
+        )
+    }
 
     /**
-     * Names the one condition that makes MyKVM look broken for no visible
-     * reason, rather than letting the user hunt for it.
-     *
      * A VPN that declares itself non-bypassable covers every UID, and the
      * system refuses to let an app route around it — binding to Wi-Fi succeeds
      * and changes nothing. The symptom is a one-way network: broadcasts from
-     * the LAN still arrive, while everything sent disappears into the tunnel.
-     * The fix lives in the VPN's settings (Proton: Connection, Advanced, LAN
-     * connections), not in this app.
+     * the LAN still arrive, while everything sent vanishes into the tunnel.
      */
     private fun warnIfTunnelled(): String? {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return null
@@ -190,9 +345,10 @@ class MainActivity : AppCompatActivity() {
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
                 !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
         }
-
-        if (!tunnelled) return null
-        Log.w(MyKvmService.TAG, "a non-bypassable VPN is active")
-        return "A VPN is active. If no peer appears, allow LAN connections in its settings."
+        return if (tunnelled) {
+            "A VPN is active. Allow LAN connections in its settings, or no peer will appear."
+        } else {
+            null
+        }
     }
 }

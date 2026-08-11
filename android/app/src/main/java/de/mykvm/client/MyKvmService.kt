@@ -52,21 +52,28 @@ class MyKvmService : Service() {
             return START_STICKY
         }
 
+        val settings = Settings(this)
+
         acquireMulticastLock()
         bindToWifi()
-        cursor = CursorOverlay(this).also {
-            if (!it.canShow()) {
-                Log.w(TAG, "no overlay permission; the pointer will stay invisible")
+        cursor = if (settings.showCursor) {
+            CursorOverlay(this).also {
+                if (!it.canShow()) {
+                    Log.w(TAG, "no overlay permission; the pointer will stay invisible")
+                }
             }
+        } else {
+            null
         }
 
         val (width, height) = screenSize()
         val error = NativeCore.nativeStart(
-            Build.MODEL ?: "Android",
-            DISCOVERY_PORT,
+            settings.deviceName,
+            settings.discoveryPort,
             width,
             height,
             filesDir.absolutePath,
+            settings.verboseLogging,
         )
 
         if (error.isNotEmpty()) {
@@ -368,7 +375,6 @@ class MyKvmService : Service() {
         const val ACTION_STOP = "de.mykvm.client.STOP"
         private const val CHANNEL_ID = "mykvm"
         private const val NOTIFICATION_ID = 1
-        private const val DISCOVERY_PORT = 47833
         private const val CURSOR_IDLE_MS = 2000L
         // Ordinals from the core's flatten(): Left, Right, Middle, Back, Forward.
         private const val BUTTON_LEFT = 0
@@ -380,6 +386,16 @@ class MyKvmService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, MyKvmService::class.java))
+        }
+
+        /**
+         * Throws away the cluster membership, so the phone announces itself as
+         * needing to pair again. The QUIC identity is deliberately kept: a new
+         * certificate would break the desktop's pinning as well, turning a
+         * re-pair into a two-sided cleanup.
+         */
+        fun forgetPairing(context: Context) {
+            File(context.filesDir, "pairing.txt").delete()
         }
 
         /**

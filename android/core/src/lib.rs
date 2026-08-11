@@ -11,7 +11,7 @@ use std::{path::PathBuf, sync::Mutex, time::Duration};
 
 use jni::{
     objects::{JClass, JString},
-    sys::{jint, jintArray, jstring},
+    sys::{jboolean, jint, jintArray, jstring},
     JNIEnv,
 };
 
@@ -45,10 +45,17 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStart(
     screen_width: jint,
     screen_height: jint,
     identity_dir: JString,
+    verbose: jboolean,
 ) -> jstring {
+    // Matches the desktop's log level setting: info is enough to follow what
+    // happens, debug is what tracking something down needs.
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Debug)
+            .with_max_level(if verbose != 0 {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Info
+            })
             .with_tag("mykvm"),
     );
 
