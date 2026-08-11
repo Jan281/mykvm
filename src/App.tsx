@@ -1035,14 +1035,21 @@ function App() {
     };
   }, []);
 
+  /** Whether Alt was held during the drag; read when it ends. */
+  const altDragRef = useRef(false);
+
   const endDrag = useEffectEvent(() => {
     if (layout && dragState) {
       const screen = getScreenById(layout, dragState.screenId);
       const currentPosition = screen ? { x: screen.x, y: screen.y } : null;
       const startPosition = { x: dragState.startX, y: dragState.startY };
+      // Alt means "exactly here", overlap and all — the same promise it makes
+      // for snapping. Without it a drop that overlaps is nudged aside, and if
+      // no free spot is found the machine returns to where it started.
       const nextLayout =
         screen &&
         currentPosition &&
+        !altDragRef.current &&
         screenPositionOverlaps(layout, dragState.screenId, currentPosition)
           ? moveScreen(
               layout,
@@ -1098,6 +1105,7 @@ function App() {
       // screen onto a neighbour's line from a good distance away, which is what
       // you want almost always — and exactly what you cannot fight when the
       // place you mean lies just inside that pull.
+      altDragRef.current = event.altKey;
       const nextPosition = event.altKey
         ? wanted
         : snapScreenPosition(current.layout, dragState.screenId, wanted);

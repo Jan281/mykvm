@@ -37,8 +37,12 @@ export function screenPositionOverlaps(
   }
 
   const nextScreen = { ...movingScreen, ...nextPosition }
+  // A device moves as one block, so its own screens are not obstacles — they
+  // travelled with it. Counting them made a drop look impossible and sent the
+  // machine back where it started.
   return flattenScreens(layout).some(
-    (screen) => screen.id !== screenId && screensOverlap(nextScreen, screen),
+    (screen) =>
+      screen.deviceId !== movingScreen.deviceId && screensOverlap(nextScreen, screen),
   )
 }
 
