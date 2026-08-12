@@ -3058,6 +3058,13 @@ pub fn run() {
                 )
             })?;
 
+            // Lets the RemoteDesktop portal remember its grant across
+            // restarts instead of prompting on every launch.
+            #[cfg(target_os = "linux")]
+            crate::linux_inject::set_restore_token_path(
+                config_dir.join("remote-desktop-token"),
+            );
+
             let detected_layout = detect_local_layout(app.handle());
             let runtime = AppRuntime::new(
                 app.handle().clone(),

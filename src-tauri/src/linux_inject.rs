@@ -34,7 +34,9 @@
 
 use std::{
     collections::HashMap,
-    os::unix::net::UnixStream,
+    io::Write,
+    os::unix::{fs::OpenOptionsExt, net::UnixStream},
+    path::PathBuf,
     sync::{mpsc, OnceLock},
     time::{Duration, Instant},
 };
@@ -119,6 +121,53 @@ static SERVICE: OnceLock<Result<InjectService, String>> = OnceLock::new();
 /// check-without-re-ask shape `input_receive_status` already uses for
 /// macOS's Accessibility/Secure-Input checks.
 static DENIED: OnceLock<String> = OnceLock::new();
+
+/// Where the portal's restore token lives. Handed over at startup rather
+/// than worked out here, because resolving the app's config directory is
+/// Tauri's job and this module has no app handle.
+static TOKEN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Called once during setup. Without it, injection still works — the user is
+/// simply asked again on every start.
+pub fn set_restore_token_path(path: PathBuf) {
+    let _ = TOKEN_PATH.set(path);
+}
+
+fn load_restore_token() -> Option<String> {
+    let token = std::fs::read_to_string(TOKEN_PATH.get()?).ok()?;
+    let token = token.trim().to_owned();
+    (!token.is_empty()).then_some(token)
+}
+
+/// A restore token re-grants control of this machine's input, so it is
+/// written owner-only. The portal issues a fresh one per session and treats
+/// the previous as spent, which is why this runs on every successful start
+/// and not just the first.
+fn store_restore_token(token: Option<&str>) {
+    let Some(path) = TOKEN_PATH.get() else {
+        return;
+    };
+    let Some(token) = token else {
+        // No new token means the old one is spent and nothing replaces it;
+        // keeping it would only produce a failed restore next time.
+        let _ = std::fs::remove_file(path);
+        log::debug!("[wayland] portal returned no restore token; permission will be asked again");
+        return;
+    };
+
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(token.as_bytes()));
+
+    match written {
+        Ok(()) => log::debug!("[wayland] stored a fresh remote-desktop restore token"),
+        Err(error) => log::warn!("[wayland] could not store the restore token: {error}"),
+    }
+}
 
 pub fn service() -> Result<&'static InjectService, String> {
     SERVICE
@@ -463,12 +512,17 @@ async fn service_loop(
         }
     };
 
+    // `ExplicitlyRevoked` rather than `Application`: the latter forgets the
+    // grant when the process ends, which is exactly the case that made the
+    // dialog reappear on every launch. Handing back a token we were given
+    // earlier is what lets the portal skip the prompt entirely.
+    let restore_token = load_restore_token();
     if let Err(error) = remote_desktop
         .select_devices(
             &session,
             DeviceType::Keyboard | DeviceType::Pointer,
-            None,
-            PersistMode::DoNot,
+            restore_token.as_deref(),
+            PersistMode::ExplicitlyRevoked,
         )
         .await
         .and_then(|request| request.response())
@@ -515,9 +569,10 @@ async fn service_loop(
             }
             result = &mut start_request, if !granted && DENIED.get().is_none() => {
                 match result.and_then(|request| request.response()) {
-                    Ok(_selected) => {
+                    Ok(selected) => {
                         granted = true;
                         log::info!("[wayland] remote-desktop injection permitted");
+                        store_restore_token(selected.restore_token());
                         // Only now: ConnectToEIS needs a started session.
                         match connect_eis(&remote_desktop, &session).await {
                             Ok((sink, events)) => {
