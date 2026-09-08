@@ -1228,6 +1228,66 @@ impl AppRuntime {
     ///
     /// Deliberately does nothing when the runtime is stopped: a runtime the
     /// user turned off must stay off.
+    /// Re-reads this machine's displays and adopts them if they changed.
+    ///
+    /// Detection otherwise runs exactly twice: once at startup, and once per
+    /// press of "Reload screen configurations". Unplugging a monitor while the
+    /// app runs therefore left the old set in place — and since a peer
+    /// announces the screens held in its *layout*, a laptop that lost two of
+    /// its three displays kept telling the controlling machine it still had
+    /// three. Nothing on the controlling side could correct that: its own
+    /// reload button only re-reads its own displays.
+    ///
+    /// Compared against `native_layout` rather than the live layout, because
+    /// that holds what detection last reported. The live layout also carries
+    /// the arrangement the user dragged on the board, which must not read as a
+    /// hardware change.
+    fn refresh_local_screens_if_changed(&self) -> bool {
+        let device_id = self
+            .layout_snapshot()
+            .devices
+            .iter()
+            .find(|device| device.role == "local")
+            .map(|device| device.id.clone())
+            .unwrap_or_else(|| "local-device".to_string());
+
+        let detected = detect_local_screens(&self.app_handle, &device_id);
+        if detected.is_empty() {
+            return false;
+        }
+
+        {
+            let Ok(mut native) = self.native_layout.lock() else {
+                return false;
+            };
+            let Some(local) = native.devices.iter_mut().find(|device| device.role == "local")
+            else {
+                return false;
+            };
+            if !screen_configuration_changed(&local.screens, &detected) {
+                return false;
+            }
+            log::info!(
+                "display configuration changed: {} screen(s) -> {} screen(s)",
+                local.screens.len(),
+                detected.len()
+            );
+            local.screens = detected.clone();
+        }
+
+        let Ok(mut layout) = self.layout.lock() else {
+            return false;
+        };
+        if let Some(local) = layout.devices.iter_mut().find(|device| device.role == "local") {
+            local.screens = adopt_detected_screens(&local.screens, &detected);
+        }
+        if let Err(error) = write_layout_to_disk(&self.config_path, &layout) {
+            log::warn!("could not persist the new display configuration: {error}");
+        }
+
+        true
+    }
+
     fn rearm_input_if_wiring_changed(&self) -> bool {
         let layout = self.layout_snapshot();
         if layout.input_mode == "receive" {
@@ -3089,14 +3149,28 @@ pub fn run() {
                 // stop/start by hand.
                 {
                     let handle = app.handle().clone();
-                    std::thread::spawn(move || loop {
-                        std::thread::sleep(Duration::from_secs(1));
-                        let Some(state) = handle.try_state::<AppRuntime>() else {
-                            break;
-                        };
-                        if state.inner().rearm_input_if_wiring_changed() {
-                            if let Ok(runtime) = state.inner().runtime.lock() {
-                                notify_runtime_state_changed(&handle, &runtime);
+                    std::thread::spawn(move || {
+                        let mut tick: u64 = 0;
+                        loop {
+                            std::thread::sleep(Duration::from_secs(1));
+                            let Some(state) = handle.try_state::<AppRuntime>() else {
+                                break;
+                            };
+
+                            // Displays come and go without telling anyone —
+                            // a docking station, a projector, a laptop that
+                            // travelled. Asking the OS every few seconds is
+                            // cheap, and it is the only way a peer stops
+                            // announcing screens it no longer has.
+                            tick += 1;
+                            if tick % 3 == 0 {
+                                state.inner().refresh_local_screens_if_changed();
+                            }
+
+                            if state.inner().rearm_input_if_wiring_changed() {
+                                if let Ok(runtime) = state.inner().runtime.lock() {
+                                    notify_runtime_state_changed(&handle, &runtime);
+                                }
                             }
                         }
                     });
@@ -4160,6 +4234,58 @@ fn detect_local_screens(app: &AppHandle, device_id: &str) -> Vec<Screen> {
                 // drawn; the caller carries the user's value over.
                 board_scale: default_board_scale(),
                 is_primary,
+            }
+        })
+        .collect()
+}
+
+/// Whether the operating system is reporting a different set of displays than
+/// it did last time.
+///
+/// Compares only what detection produces. `board_scale` is the user's drawing
+/// preference and never comes from the OS, so it must not count as a change or
+/// the watcher would fire in a loop.
+fn screen_configuration_changed(previous: &[Screen], detected: &[Screen]) -> bool {
+    if previous.len() != detected.len() {
+        return true;
+    }
+
+    previous.iter().zip(detected).any(|(before, now)| {
+        before.id != now.id
+            || before.name != now.name
+            || before.x != now.x
+            || before.y != now.y
+            || before.width != now.width
+            || before.height != now.height
+            || before.scale != now.scale
+            || before.is_primary != now.is_primary
+    })
+}
+
+/// Folds a new display configuration into the layout.
+///
+/// A screen the user has arranged on the board keeps that arrangement as long
+/// as it is still the same panel — unplugging a second monitor should not shove
+/// the first one somewhere else. Anything new, resized or rescaled takes the
+/// position the operating system reports, since there is nothing of the user's
+/// to preserve for it.
+fn adopt_detected_screens(current: &[Screen], detected: &[Screen]) -> Vec<Screen> {
+    detected
+        .iter()
+        .map(|screen| {
+            let Some(existing) = current.iter().find(|candidate| candidate.id == screen.id) else {
+                return screen.clone();
+            };
+
+            let unchanged = existing.width == screen.width
+                && existing.height == screen.height
+                && existing.scale == screen.scale;
+
+            Screen {
+                board_scale: existing.board_scale,
+                x: if unchanged { existing.x } else { screen.x },
+                y: if unchanged { existing.y } else { screen.y },
+                ..screen.clone()
             }
         })
         .collect()
@@ -7086,6 +7212,99 @@ mod tests {
             edge_links: None,
             log_level: default_log_level(),
         }
+    }
+
+    fn detected_screen(id: &str, name: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
+        Screen {
+            id: id.into(),
+            device_id: "local-device".into(),
+            name: name.into(),
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0,
+            board_scale: default_board_scale(),
+            is_primary: id.ends_with("-1"),
+        }
+    }
+
+    #[test]
+    fn unplugging_a_monitor_reads_as_a_configuration_change() {
+        // The laptop travelled: three displays became one. Left undetected,
+        // it kept announcing three to the controlling machine, which had no
+        // way of its own to correct the count.
+        let docked = vec![
+            detected_screen("local-display-1", "\\\\.\\DISPLAY1", 0, 0, 1920, 1200),
+            detected_screen("local-display-2", "\\\\.\\DISPLAY2", 1920, 0, 1920, 1080),
+            detected_screen("local-display-3", "\\\\.\\DISPLAY3", 3840, 0, 1920, 1080),
+        ];
+        let travelling = vec![docked[0].clone()];
+
+        assert!(screen_configuration_changed(&docked, &travelling));
+        assert!(screen_configuration_changed(&travelling, &docked));
+    }
+
+    #[test]
+    fn redrawing_a_screen_on_the_board_is_not_a_configuration_change() {
+        // board_scale is the user's drawing preference and never comes from the
+        // operating system. Counting it would make the watcher fire in a loop.
+        let detected = vec![detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)];
+        let mut resized = detected.clone();
+        resized[0].board_scale = 2.5;
+
+        assert!(!screen_configuration_changed(&detected, &resized));
+    }
+
+    #[test]
+    fn adopting_a_new_configuration_keeps_the_arrangement_of_untouched_screens() {
+        // The user dragged DP-1 well away from where the OS reports it, and
+        // scaled it on the board. Unplugging a second monitor must not shove it
+        // back — the panel itself did not change.
+        let arranged = vec![Screen {
+            x: 4000,
+            y: 300,
+            board_scale: 1.75,
+            ..detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)
+        }];
+        let detected = vec![detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)];
+
+        let adopted = adopt_detected_screens(&arranged, &detected);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!((adopted[0].x, adopted[0].y), (4000, 300));
+        assert_eq!(adopted[0].board_scale, 1.75);
+    }
+
+    #[test]
+    fn a_resized_screen_takes_the_position_the_system_reports() {
+        // Nothing of the user's is worth preserving for a panel that changed
+        // resolution: their arrangement was built around the old size.
+        let arranged = vec![Screen {
+            x: 4000,
+            y: 300,
+            board_scale: 1.75,
+            ..detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)
+        }];
+        let detected = vec![detected_screen("local-display-1", "DP-1", 0, 0, 3840, 2160)];
+
+        let adopted = adopt_detected_screens(&arranged, &detected);
+        assert_eq!((adopted[0].x, adopted[0].y), (0, 0));
+        // The drawing preference is still the user's, whatever the size.
+        assert_eq!(adopted[0].board_scale, 1.75);
+    }
+
+    #[test]
+    fn a_newly_attached_screen_lands_where_the_system_puts_it() {
+        let existing = vec![detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)];
+        let detected = vec![
+            detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080),
+            detected_screen("local-display-2", "HDMI-A-1", 1920, 0, 2560, 1440),
+        ];
+
+        let adopted = adopt_detected_screens(&existing, &detected);
+        assert_eq!(adopted.len(), 2);
+        assert_eq!((adopted[1].x, adopted[1].y), (1920, 0));
+        assert_eq!(adopted[1].board_scale, default_board_scale());
     }
 
     fn test_peer() -> LanPeer {
