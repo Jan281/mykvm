@@ -81,38 +81,100 @@ fn default_route_ipv4_address() -> Option<Ipv4Addr> {
     }
 }
 
-/// Orders candidates so that addresses on a real subnet come before
-/// point-to-point ones, and puts the default route first *within* that.
+/// How readily another machine on the same LAN can reach an address of ours.
 ///
-/// A VPN hands out a /32 on a tunnel interface and takes over the default
-/// route, so asking the routing table alone yields an address that no peer on
-/// the LAN can reach and a broadcast that vanishes into the tunnel. Since the
-/// first address is what a peer announces as its own, that address has to be
-/// one others can actually send to.
+/// Ordering matters: the first address is the one a peer announces as its own
+/// and the one others will send input to, so it has to be reachable from the
+/// LAN rather than merely present on this machine.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum AddressRank {
+    /// A private address on a real subnet, on an interface that looks physical.
+    Lan,
+    /// A real subnet we cannot place. Probably fine, just not obviously a LAN.
+    Routable,
+    /// Container bridges and virtual-machine host adapters. Present on this
+    /// machine, reachable by nothing else on the network.
+    Virtual,
+    /// A VPN or other tunnel. Reachable only by whatever is inside the tunnel.
+    Tunnel,
+}
+
+/// Interface-name fragments that give a tunnel away, lowercased.
+///
+/// Names are the most reliable signal available: a VPN's address range is not.
+/// A tunnel may hand out 10.8.0.0/24, and a real office LAN may be 10.0.0.0/8 —
+/// the addresses are indistinguishable, the interface names are not.
+const TUNNEL_NAME_FRAGMENTS: &[&str] = &[
+    "tun", "tap", "wg", "ppp", "ipsec", "proton", "nordlynx", "mullvad", "tailscale", "zt",
+    "wireguard", "openvpn", "vpn",
+];
+
+/// The same for interfaces that exist only inside this machine.
+const VIRTUAL_NAME_FRAGMENTS: &[&str] = &[
+    "docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "vethernet", "lxc", "podman", "cni",
+    "hyper-v",
+];
+
+fn classify_address(name: &str, address: Ipv4Addr, has_subnet: bool) -> AddressRank {
+    let name = name.to_ascii_lowercase();
+    let mentions = |fragments: &[&str]| fragments.iter().any(|fragment| name.contains(fragment));
+
+    // A point-to-point address has no subnet to broadcast on, which is what a
+    // classic VPN endpoint looks like.
+    if !has_subnet {
+        return AddressRank::Tunnel;
+    }
+    // 100.64.0.0/10 is carrier-grade NAT, which VPN clients borrow for their
+    // own plumbing — ProtonVPN's kill-switch interface lives there, and it
+    // carries a real /24, so nothing but the range gives it away.
+    let [first, second, ..] = address.octets();
+    if first == 100 && (64..=127).contains(&second) {
+        return AddressRank::Tunnel;
+    }
+    if mentions(TUNNEL_NAME_FRAGMENTS) {
+        return AddressRank::Tunnel;
+    }
+    if mentions(VIRTUAL_NAME_FRAGMENTS) {
+        return AddressRank::Virtual;
+    }
+    if address.is_private() {
+        return AddressRank::Lan;
+    }
+
+    AddressRank::Routable
+}
+
+/// Orders candidates so the address peers can actually reach comes first.
+///
+/// A VPN takes over the default route, so asking the routing table alone yields
+/// an address no peer on the LAN can reach and a broadcast that vanishes into
+/// the tunnel. Ranking by reachability first, and only then by anything else,
+/// is what keeps the announced address a real one.
 fn prefer_lan_addresses(
-    candidates: &[(Ipv4Addr, bool)],
+    candidates: &[(Ipv4Addr, AddressRank)],
     default_route: Option<Ipv4Addr>,
 ) -> Vec<Ipv4Addr> {
-    let collect = |wanted: bool| {
-        let mut list: Vec<Ipv4Addr> = candidates
-            .iter()
-            .filter(|(_, has_subnet)| *has_subnet == wanted)
-            .map(|(address, _)| *address)
-            .collect();
-        list.sort_by_key(Ipv4Addr::octets);
-        list.dedup();
-        list
-    };
+    let mut ranked = candidates.to_vec();
+    // Octets only break ties within a rank, so the order is stable rather than
+    // meaningful. Ranking used to be the tie-breaker itself, which is how a
+    // tunnel on 100.85.0.1 beat the Wi-Fi address on 192.168.2.115.
+    ranked.sort_by_key(|(address, rank)| (*rank, address.octets()));
 
-    let mut ordered: Vec<Ipv4Addr> = collect(true).into_iter().chain(collect(false)).collect();
+    let mut ordered: Vec<Ipv4Addr> = Vec::with_capacity(ranked.len());
+    for (address, _) in ranked {
+        if !ordered.contains(&address) {
+            ordered.push(address);
+        }
+    }
 
-    // The default route only earns the front spot if it is itself on a subnet;
-    // a tunnel address stays wherever it landed.
+    // Among several LAN addresses the routing table knows best which one the
+    // machine actually uses. A tunnel or bridge never earns the front spot,
+    // however emphatically it owns the default route.
     if let Some(default_ip) = default_route.filter(|ip| usable_discovery_ipv4(*ip)) {
-        let on_subnet = candidates
+        let is_lan = candidates
             .iter()
-            .any(|(address, has_subnet)| *address == default_ip && *has_subnet);
-        if on_subnet {
+            .any(|(address, rank)| *address == default_ip && *rank == AddressRank::Lan);
+        if is_lan {
             ordered.retain(|address| *address != default_ip);
             ordered.insert(0, default_ip);
         } else if !ordered.contains(&default_ip) {
@@ -139,7 +201,10 @@ pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
             if usable_discovery_ipv4(address.ip) {
                 // A /32 is a tunnel endpoint, not a subnet we can broadcast on.
                 let has_subnet = address.netmask != Ipv4Addr::new(255, 255, 255, 255);
-                candidates.push((address.ip, has_subnet));
+                candidates.push((
+                    address.ip,
+                    classify_address(&interface.name, address.ip, has_subnet),
+                ));
             }
         }
     }
@@ -262,6 +327,13 @@ pub fn local_peer_id(host: &str, ip: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Classifies the way `local_ipv4_addresses` does, so the tests describe
+    /// real interfaces rather than pre-chewed ranks.
+    fn candidate(name: &str, address: &str, has_subnet: bool) -> (Ipv4Addr, AddressRank) {
+        let address: Ipv4Addr = address.parse().expect("test address");
+        (address, classify_address(name, address, has_subnet))
+    }
+
     #[test]
     fn a_vpn_tunnel_never_becomes_the_address_we_advertise() {
         // Exactly the observed setup: ProtonVPN hands out 10.2.0.2/32 and owns
@@ -269,7 +341,13 @@ mod tests {
         // the tunnel made the phone unreachable for the desktop.
         let lan = Ipv4Addr::new(192, 168, 1, 124);
         let tunnel = Ipv4Addr::new(10, 2, 0, 2);
-        let ordered = prefer_lan_addresses(&[(tunnel, false), (lan, true)], Some(tunnel));
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("proton0", "10.2.0.2", false),
+                candidate("wlan0", "192.168.1.124", true),
+            ],
+            Some(tunnel),
+        );
 
         assert_eq!(ordered.first(), Some(&lan));
         // The tunnel is still worth announcing on, just never first.
@@ -277,13 +355,89 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_carrying_a_real_subnet_is_still_a_tunnel() {
+        // The regression that made this rewrite necessary. ProtonVPN's
+        // kill-switch interface holds 100.85.0.1/24 — a genuine subnet, so the
+        // /32 rule missed it — and 100 sorts ahead of 192, so it was announced
+        // in place of the Wi-Fi address. Two Docker bridges came next, and the
+        // only reachable address ended up fourth.
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("docker0", "172.17.0.1", true),
+                candidate("br-9f5b6dbd1745", "172.18.0.1", true),
+                candidate("wlan0", "192.168.2.115", true),
+                candidate("pvpnksintrf0", "100.85.0.1", true),
+                candidate("proton0", "10.2.0.2", false),
+            ],
+            Some(Ipv4Addr::new(100, 85, 0, 1)),
+        );
+
+        assert_eq!(ordered.first(), Some(&Ipv4Addr::new(192, 168, 2, 115)));
+    }
+
+    #[test]
+    fn a_vpn_handing_out_an_ordinary_lan_range_is_caught_by_its_name() {
+        // Nothing about 10.8.0.4/24 says "tunnel" — a real office LAN looks
+        // exactly like it. The interface name is the only thing that does.
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("tun0", "10.8.0.4", true),
+                candidate("wlan0", "192.168.2.115", true),
+            ],
+            Some(Ipv4Addr::new(10, 8, 0, 4)),
+        );
+
+        assert_eq!(ordered.first(), Some(&Ipv4Addr::new(192, 168, 2, 115)));
+    }
+
+    #[test]
+    fn container_bridges_rank_below_the_lan_but_above_tunnels() {
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("docker0", "172.17.0.1", true),
+                candidate("tun0", "10.8.0.4", true),
+                candidate("eth0", "192.168.0.10", true),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            ordered,
+            vec![
+                Ipv4Addr::new(192, 168, 0, 10),
+                Ipv4Addr::new(172, 17, 0, 1),
+                Ipv4Addr::new(10, 8, 0, 4),
+            ]
+        );
+    }
+
+    #[test]
     fn the_default_route_still_wins_when_it_is_a_normal_interface() {
         let wired = Ipv4Addr::new(192, 168, 0, 10);
         let wireless = Ipv4Addr::new(192, 168, 1, 124);
-        let ordered =
-            prefer_lan_addresses(&[(wireless, true), (wired, true)], Some(wireless));
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("wlan0", "192.168.1.124", true),
+                candidate("eth0", "192.168.0.10", true),
+            ],
+            Some(wireless),
+        );
 
         assert_eq!(ordered, vec![wireless, wired]);
+    }
+
+    #[test]
+    fn windows_hyper_v_adapters_do_not_pass_for_a_lan() {
+        // if_addrs reports Windows adapters by their friendly name.
+        let ordered = prefer_lan_addresses(
+            &[
+                candidate("vEthernet (Default Switch)", "172.20.16.1", true),
+                candidate("Wi-Fi", "192.168.2.117", true),
+            ],
+            None,
+        );
+
+        assert_eq!(ordered.first(), Some(&Ipv4Addr::new(192, 168, 2, 117)));
     }
 
     #[test]

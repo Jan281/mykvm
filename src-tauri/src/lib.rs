@@ -38,7 +38,8 @@ pub use mykvm_protocol::transport as quic_transport;
 use mykvm_protocol::discovery::{
     broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
     normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
-    detect_keyboard_layout, local_peer_id, random_pairing_code, sanitize_id, DiscoveryPacket, LanPeer, LanPeerScreen,
+    detect_keyboard_layout, local_ipv4_addresses, local_peer_id, random_pairing_code, sanitize_id,
+    DiscoveryPacket, LanPeer, LanPeerScreen,
     DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     TRANSPORT_PORT_MAX,
 };
@@ -4493,11 +4494,17 @@ fn local_ip_address() -> Option<String> {
     probe_local_ip_address()
 }
 
+/// The address this machine announces as its own.
+///
+/// Deliberately the same ranking the discovery targets use, rather than asking
+/// the routing table which source address reaches the internet. A VPN owns that
+/// route, so the old probe announced the tunnel — and since the peer id is
+/// built from this address, starting a VPN also changed our identity and left
+/// the other machine sending input to somewhere it could not reach.
 fn probe_local_ip_address() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let address = socket.local_addr().ok()?;
-    Some(address.ip().to_string())
+    local_ipv4_addresses()
+        .first()
+        .map(|address| address.to_string())
 }
 
 fn default_device_source() -> String {
