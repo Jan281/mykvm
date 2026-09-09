@@ -78,6 +78,7 @@ class MyKvmService : Service() {
             width,
             height,
             filesDir.absolutePath,
+            settings.preferredInterface,
             settings.verboseLogging,
         )
 

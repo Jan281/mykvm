@@ -54,6 +54,19 @@ class Settings(context: Context) {
         get() = store.getBoolean(KEY_WAKE, true)
         set(value) = store.edit().putBoolean(KEY_WAKE, value).apply()
 
+    /**
+     * Interface to be reached on, by name; empty leaves it to the automatic
+     * ranking, which is right almost always.
+     *
+     * The name is stored rather than the address, because a phone changes
+     * network constantly and the address with it. A name that holds no address
+     * right now is ignored rather than honoured, so a stale pick cannot make
+     * the phone unreachable.
+     */
+    var preferredInterface: String
+        get() = store.getString(KEY_INTERFACE, "") ?: ""
+        set(value) = store.edit().putString(KEY_INTERFACE, value.trim()).apply()
+
     /** Matches the desktop's log level setting; debug is what a bug report needs. */
     var verboseLogging: Boolean
         get() = store.getBoolean(KEY_VERBOSE, false)
@@ -67,6 +80,7 @@ class Settings(context: Context) {
         const val KEY_LAYOUT = "keyboard_layout"
         const val KEY_VERBOSE = "verbose"
         const val KEY_WAKE = "wake_on_input"
+        const val KEY_INTERFACE = "preferred_interface"
         const val DEFAULT_PORT = 47833
     }
 }

@@ -59,6 +59,7 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStart(
     screen_width: jint,
     screen_height: jint,
     identity_dir: JString,
+    preferred_interface: JString,
     verbose: jboolean,
 ) -> jstring {
     // Matches the desktop's log level setting: info is enough to follow what
@@ -79,6 +80,7 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStart(
         screen_width,
         screen_height,
         identity_dir: PathBuf::from(take_string(&mut env, &identity_dir)),
+        preferred_interface: take_string(&mut env, &preferred_interface),
     };
 
     let Ok(mut slot) = CLIENT.lock() else {
@@ -99,6 +101,32 @@ pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeStart(
             to_java_string(&env, &error)
         }
     }
+}
+
+/// The interfaces the settings screen offers to pin, one per line as
+/// `name\taddress\tkind`.
+///
+/// A flat string rather than a JVM object array: the boundary is deliberately
+/// thin, and Kotlin splitting two separators is less code on both sides than
+/// constructing a class from Rust. Callable before the client starts, which is
+/// the point — the user picks the interface *then* connects.
+#[no_mangle]
+pub extern "system" fn Java_de_mykvm_client_NativeCore_nativeListInterfaces(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let listed = mykvm_protocol::discovery::local_ipv4_interfaces()
+        .into_iter()
+        .map(|interface| {
+            format!(
+                "{}\t{}\t{}",
+                interface.name, interface.address, interface.kind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    to_java_string(&env, &listed)
 }
 
 /// Blocks for up to `timeout_ms` and returns `[kind, p1, p2]`, or null on

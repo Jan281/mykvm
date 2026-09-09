@@ -202,6 +202,10 @@ class MainActivity : ComponentActivity() {
         var cursor by remember { mutableStateOf(settings.showCursor) }
         var wake by remember { mutableStateOf(settings.wakeOnInput) }
         var verbose by remember { mutableStateOf(settings.verboseLogging) }
+        var pinned by remember { mutableStateOf(settings.preferredInterface) }
+        // Read once per visit to this screen. Reopening it re-reads, which is
+        // what someone who just turned a VPN on will do anyway.
+        val interfaces = remember { NativeCore.listInterfaces() }
         var paired by remember { mutableStateOf(MyKvmService.isPaired(this)) }
 
         Section("Settings") {
@@ -273,6 +277,49 @@ class MainActivity : ComponentActivity() {
                 },
             )
 
+            Text(
+                "Network interface",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "The interface the desktop reaches this phone on. Automatic skips " +
+                    "VPN tunnels; pick one by hand only when it still guesses wrong. " +
+                    "An interface with no address right now is ignored, so a stale " +
+                    "pick cannot strand the phone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = pinned.isEmpty(),
+                    onClick = {
+                        pinned = ""
+                        settings.preferredInterface = ""
+                    },
+                    label = { Text("Automatic") },
+                )
+                interfaces.forEach { option ->
+                    FilterChip(
+                        selected = pinned == option.name,
+                        onClick = {
+                            pinned = option.name
+                            settings.preferredInterface = option.name
+                        },
+                        label = { Text("${option.name} · ${option.address} · ${option.kind}") },
+                    )
+                }
+                // A pick whose interface has gone must stay visible and
+                // selected, or the screen would look like it was never made.
+                if (pinned.isNotEmpty() && interfaces.none { it.name == pinned }) {
+                    FilterChip(
+                        selected = true,
+                        onClick = {},
+                        label = { Text("$pinned · no address — automatic in use") },
+                    )
+                }
+            }
+
             StatusRow(
                 "Keyboard layout",
                 if (announced.isEmpty()) "not announced yet — using the built-in default"
@@ -292,7 +339,7 @@ class MainActivity : ComponentActivity() {
             )
 
             Text(
-                "The name and port take effect when the client is restarted.",
+                "The name, port and interface take effect when the client is restarted.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -16,6 +16,11 @@ The JNI boundary is deliberately narrow and has **no callbacks into the JVM**:
 Kotlin blocks in `nativePoll` on one thread and gets three integers per event. A
 callback would need an attach and a global reference on every mouse move.
 
+Everything crossing it is a primitive or a flat string for the same reason —
+`nativeListInterfaces` returns `name\taddress\tkind` lines rather than an object
+array, because splitting on two separators in Kotlin is less code on both sides
+than building a class from Rust.
+
 Why each Android component exists:
 
 - **Foreground service** — Android destroys activities freely, and a client that

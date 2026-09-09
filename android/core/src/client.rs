@@ -21,7 +21,8 @@ use mykvm_protocol::{
     clipboard::{ClipboardPacket, CLIPBOARD_PROTOCOL},
     discovery::{
         broadcast_addrs, discovery_target_ports, local_ipv4_addresses, local_peer_id,
-        preferred_quic_port, random_pairing_code, DiscoveryPacket, LanPeer, LanPeerScreen,
+        preferred_quic_port, random_pairing_code, set_preferred_interface, DiscoveryPacket,
+        LanPeer, LanPeerScreen,
         DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     },
     input::InputEvent,
@@ -124,6 +125,13 @@ pub struct Config {
     /// the desktop's certificate pinning and force a re-pair, so this must be
     /// somewhere durable — the app's files directory.
     pub identity_dir: PathBuf,
+    /// Interface to be reached on, by name. Empty leaves it automatic.
+    ///
+    /// A phone rarely needs this — the automatic ranking already skips VPN
+    /// tunnels — but a VPN that hands out an ordinary-looking subnet on an
+    /// interface named unlike any tunnel is exactly what no heuristic can
+    /// place, and then the desktop cannot reach the phone at all.
+    pub preferred_interface: String,
 }
 
 /// A running client. Dropping it does not stop the threads; call [`Client::stop`].
@@ -309,6 +317,10 @@ impl Client {
 }
 
 pub fn start(config: Config) -> Result<Client, String> {
+    // Before the first address is read: the announced identity, the broadcast
+    // targets and the sweep all consult this.
+    set_preferred_interface(Some(config.preferred_interface.clone()));
+
     let ip = local_ipv4_addresses()
         .first()
         .map(|address| address.to_string())
