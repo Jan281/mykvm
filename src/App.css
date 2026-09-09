@@ -1672,6 +1672,16 @@
   color: #f4f4f5;
 }
 
+/* Hints under a setting. Only the warning variant is coloured — the plain one
+   inherits, which is what it has always done. */
+.settings-hint.warning {
+  color: #fda4af;
+}
+
+.theme-light .settings-hint.warning {
+  color: #b91c1c;
+}
+
 .muted-copy {
   margin-top: 12px !important;
   color: #a1a1aa;

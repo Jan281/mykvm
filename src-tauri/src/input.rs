@@ -7372,6 +7372,7 @@ mod tests {
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
             edge_links: None,
             log_level: "info".into(),
+            preferred_interface: None,
         }
     }
 

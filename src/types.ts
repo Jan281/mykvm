@@ -90,6 +90,14 @@ export interface Device {
   screens: Screen[]
 }
 
+/// One local network interface the machine can be reached on.
+export interface NetworkInterface {
+  name: string
+  address: string
+  /** What the automatic ranking made of it. */
+  kind: 'lan' | 'routable' | 'virtual' | 'tunnel'
+}
+
 export interface LayoutState {
   devices: Device[]
   activeDeviceId: string
@@ -120,4 +128,6 @@ export interface LayoutState {
   edgeLinks: EdgeLink[] | null
   /** How much detail goes into the log file. 'debug' enables per-event traces. */
   logLevel: LogLevel
+  /** Interface to be reached on, by name. `null` leaves it automatic. */
+  preferredInterface: string | null
 }

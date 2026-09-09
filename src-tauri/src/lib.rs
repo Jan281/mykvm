@@ -38,7 +38,8 @@ pub use mykvm_protocol::transport as quic_transport;
 use mykvm_protocol::discovery::{
     broadcast_addrs, default_protocol_version, default_transport_port, discovery_target_ports,
     normalize_quic_port, normalize_transport_port, preferred_quic_port, unicast_sweep_targets,
-    detect_keyboard_layout, local_ipv4_addresses, local_peer_id, random_pairing_code, sanitize_id,
+    detect_keyboard_layout, local_ipv4_addresses, local_ipv4_interfaces, local_peer_id,
+    random_pairing_code, sanitize_id, set_preferred_interface, NetworkInterface,
     DiscoveryPacket, LanPeer, LanPeerScreen,
     DISCOVERY_PROTOCOL, PAIRING_CODE_TTL_MS, PAIRING_MAX_ATTEMPTS,
     TRANSPORT_PORT_MAX,
@@ -306,6 +307,13 @@ struct LayoutState {
     /// diagnostics that are otherwise too noisy to leave on.
     #[serde(default = "default_log_level")]
     log_level: String,
+    /// Interface whose address peers should reach this machine on, by name.
+    ///
+    /// `None` — the default — leaves it to the automatic ranking. The name is
+    /// stored rather than the address, because an address belongs to one
+    /// network and this machine travels; the interface does not change.
+    #[serde(default)]
+    preferred_interface: Option<String>,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -1428,6 +1436,16 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
 /// back in. That is what this does: the local displays are read again, and the
 /// screens every client last announced are re-applied.
 ///
+/// The network interfaces the settings screen offers to pin.
+///
+/// Read fresh on every call rather than cached: an interface list is exactly
+/// the thing that changes while the window is open — that is why the user is
+/// looking at it.
+#[tauri::command]
+fn list_network_interfaces() -> Vec<NetworkInterface> {
+    local_ipv4_interfaces()
+}
+
 /// Clients need no request of their own — they announce their screens every few
 /// seconds anyway, so what discovery already holds is current.
 #[tauri::command]
@@ -1498,6 +1516,7 @@ fn save_layout(
         let saved_layout = merge_runtime_owned_layout_fields(layout, &previous_layout);
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         apply_log_level(&saved_layout.log_level);
+        set_preferred_interface(saved_layout.preferred_interface.clone());
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
     };
@@ -3134,7 +3153,11 @@ pub fn run() {
             );
             app.manage(runtime);
             // The saved level takes over from the plugin's permissive ceiling.
-            apply_log_level(&app.state::<AppRuntime>().layout_snapshot().log_level);
+            let startup_layout = app.state::<AppRuntime>().layout_snapshot();
+            apply_log_level(&startup_layout.log_level);
+            // Before discovery binds anything: every address decision reads
+            // this, and the first announce goes out within a second.
+            set_preferred_interface(startup_layout.preferred_interface.clone());
 
             // Eagerly start discovery + input BEFORE the WebView2/frontend is
             // ready. The old flow waited for the frontend to call
@@ -3240,6 +3263,7 @@ pub fn run() {
             open_log_directory,
             save_layout,
             reload_screen_configurations,
+            list_network_interfaces,
             start_runtime,
             stop_runtime,
             read_clipboard_text,
@@ -4117,6 +4141,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
     LayoutState {
         edge_links: None,
         log_level: default_log_level(),
+        preferred_interface: None,
         active_device_id: device_id.clone(),
         selected_screen_id,
         input_mode: default_input_mode(),
@@ -4162,6 +4187,7 @@ fn detect_fallback_layout() -> LayoutState {
     LayoutState {
         edge_links: None,
         log_level: default_log_level(),
+        preferred_interface: None,
         devices: Vec::new(),
         active_device_id: String::new(),
         selected_screen_id: String::new(),
@@ -4336,6 +4362,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         // and `None` here is what keeps a pre-editor layout on geometry.
         edge_links: saved_layout.edge_links.clone(),
         log_level: saved_layout.log_level.clone(),
+        preferred_interface: saved_layout.preferred_interface.clone(),
         devices,
         active_device_id,
         selected_screen_id,
@@ -7218,6 +7245,7 @@ mod tests {
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
             edge_links: None,
             log_level: default_log_level(),
+            preferred_interface: None,
         }
     }
 

@@ -9,7 +9,7 @@ import type {
   PerformanceSample,
   RuntimeStatus,
 } from './runtime'
-import type { LayoutState } from './types'
+import type { LayoutState, NetworkInterface } from './types'
 
 export interface AppUpdateInfo {
   version: string
@@ -118,6 +118,21 @@ export async function reloadScreenConfigurations(): Promise<AppStateSnapshot | n
   }
 
   return invoke<AppStateSnapshot>('reload_screen_configurations')
+}
+
+/**
+ * The local network interfaces, best-ranked first.
+ *
+ * Read on demand rather than kept in the snapshot: the list changes while the
+ * settings screen is open — a VPN comes up, a cable goes in — which is exactly
+ * when the user is looking at it.
+ */
+export async function listNetworkInterfaces(): Promise<NetworkInterface[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<NetworkInterface[]>('list_network_interfaces')
 }
 
 export async function resetPairing(): Promise<AppStateSnapshot> {

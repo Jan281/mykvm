@@ -26,6 +26,7 @@ import {
   openRepositoryUrl,
   openUpdateReleasePage,
   probeLanPeer,
+  listNetworkInterfaces,
   readDiagnosticInfo,
   readInputServiceStatus,
   readPerformanceSample,
@@ -102,6 +103,7 @@ import type {
   ModifierMap,
   LogLevel,
   ModifierTarget,
+  NetworkInterface,
   Platform,
   Screen,
   ThemeMode,
@@ -185,6 +187,20 @@ type NativeFileDragPayload =
   | { type: "cancel" }
   | { type: string; paths?: string[]; position?: FileDropPosition };
 
+/** Maps an interface rank onto its translation key. */
+function interfaceKindKey(kind: NetworkInterface["kind"]) {
+  switch (kind) {
+    case "lan":
+      return "networkKindLan" as const;
+    case "routable":
+      return "networkKindRoutable" as const;
+    case "virtual":
+      return "networkKindVirtual" as const;
+    default:
+      return "networkKindTunnel" as const;
+  }
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -221,6 +237,9 @@ function App() {
   );
   const [diagnosticInfo, setDiagnosticInfo] =
     useState<DiagnosticInfo | null>(null);
+  const [networkInterfaces, setNetworkInterfaces] = useState<NetworkInterface[]>(
+    [],
+  );
   const [diagnosticMessage, setDiagnosticMessage] = useState<string | null>(
     null,
   );
@@ -871,6 +890,18 @@ function App() {
         })
         .catch(() => {
           // Diagnostics are helpful but not required for the settings screen.
+        });
+
+      // Refreshed on the same beat: a VPN coming up or a cable going in
+      // changes this list while the user is looking at it.
+      listNetworkInterfaces()
+        .then((interfaces) => {
+          if (active) {
+            setNetworkInterfaces(interfaces);
+          }
+        })
+        .catch(() => {
+          // Without the list the picker just offers "automatic".
         });
     };
 
@@ -1693,6 +1724,13 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       logLevel,
+    }));
+  }
+
+  function setPreferredInterface(preferredInterface: string | null) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      preferredInterface,
     }));
   }
 
@@ -3173,6 +3211,50 @@ function App() {
                   </div>
                 </div>
                 <p className="settings-hint">{ui.settings.logLevelHint}</p>
+              </section>
+
+              <section className="surface-card settings-card">
+                <h2>{ui.settings.networkInterface}</h2>
+                <div className="settings-control-row">
+                  <span>{ui.settings.networkInterface}</span>
+                  <select
+                    value={layout.preferredInterface ?? ""}
+                    onChange={(event) =>
+                      setPreferredInterface(event.target.value || null)
+                    }
+                  >
+                    <option value="">{ui.settings.networkInterfaceAuto}</option>
+                    {networkInterfaces.map((item) => (
+                      <option key={item.name} value={item.name}>
+                        {`${item.name} · ${item.address} · ${
+                          ui.settings[interfaceKindKey(item.kind)]
+                        }`}
+                      </option>
+                    ))}
+                    {/* A pick whose interface is gone must stay selectable,
+                        otherwise opening the settings silently drops it. */}
+                    {layout.preferredInterface &&
+                    !networkInterfaces.some(
+                      (item) => item.name === layout.preferredInterface,
+                    ) ? (
+                      <option value={layout.preferredInterface}>
+                        {layout.preferredInterface}
+                      </option>
+                    ) : null}
+                  </select>
+                </div>
+                {layout.preferredInterface &&
+                networkInterfaces.length > 0 &&
+                !networkInterfaces.some(
+                  (item) => item.name === layout.preferredInterface,
+                ) ? (
+                  <p className="settings-hint warning">
+                    {ui.settings.networkInterfaceMissing}
+                  </p>
+                ) : null}
+                <p className="settings-hint">
+                  {ui.settings.networkInterfaceHint}
+                </p>
               </section>
 
               <section className="surface-card settings-card">

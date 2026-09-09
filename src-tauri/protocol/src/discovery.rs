@@ -6,6 +6,7 @@
 //! real traffic goes over QUIC (see [`crate::transport`]).
 
 use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +116,19 @@ const VIRTUAL_NAME_FRAGMENTS: &[&str] = &[
     "hyper-v",
 ];
 
+impl AddressRank {
+    /// The stable name the settings UI groups by. Kept separate from the
+    /// variant so translations and styling do not ride on Rust identifiers.
+    fn as_kind(self) -> &'static str {
+        match self {
+            AddressRank::Lan => "lan",
+            AddressRank::Routable => "routable",
+            AddressRank::Virtual => "virtual",
+            AddressRank::Tunnel => "tunnel",
+        }
+    }
+}
+
 fn classify_address(name: &str, address: Ipv4Addr, has_subnet: bool) -> AddressRank {
     let name = name.to_ascii_lowercase();
     let mentions = |fragments: &[&str]| fragments.iter().any(|fragment| name.contains(fragment));
@@ -185,31 +199,108 @@ fn prefer_lan_addresses(
     ordered
 }
 
+/// One local IPv4 interface, as the settings UI lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterface {
+    /// What the operating system calls it: `wlan0`, `Wi-Fi`, `tun0`.
+    pub name: String,
+    pub address: String,
+    /// "lan" | "routable" | "virtual" | "tunnel" — what the automatic ranking
+    /// made of it, so the user can see why their pick is or is not the default.
+    pub kind: String,
+}
+
+/// The interface the user pinned, if any.
+///
+/// Process-wide rather than a parameter, because every address decision — the
+/// announced identity, the broadcast targets, the unicast sweep — has to agree,
+/// and they are reached from places that have no layout to hand. Set once at
+/// startup and again whenever the setting is saved.
+static PREFERRED_INTERFACE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Pins the interface whose address peers should reach us on, or `None` to go
+/// back to the automatic ranking.
+///
+/// The name is stored, never the address: an address belongs to one network,
+/// and a laptop that travels gets a new one at every stop. The interface stays.
+pub fn set_preferred_interface(name: Option<String>) {
+    let name = name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    if let Ok(mut preferred) = PREFERRED_INTERFACE.write() {
+        *preferred = name;
+    }
+}
+
+pub fn preferred_interface() -> Option<String> {
+    PREFERRED_INTERFACE
+        .read()
+        .ok()
+        .and_then(|preferred| preferred.clone())
+}
+
+fn enumerate_candidates() -> Vec<(String, Ipv4Addr, AddressRank)> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+
+    interfaces
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .filter_map(|interface| {
+            let if_addrs::IfAddr::V4(address) = interface.addr else {
+                return None;
+            };
+            if !usable_discovery_ipv4(address.ip) {
+                return None;
+            }
+            // A /32 is a tunnel endpoint, not a subnet we can broadcast on.
+            let has_subnet = address.netmask != Ipv4Addr::new(255, 255, 255, 255);
+            let rank = classify_address(&interface.name, address.ip, has_subnet);
+            Some((interface.name, address.ip, rank))
+        })
+        .collect()
+}
+
+/// Every usable local IPv4 interface, best first, for the settings UI.
+pub fn local_ipv4_interfaces() -> Vec<NetworkInterface> {
+    let mut candidates = enumerate_candidates();
+    candidates.sort_by_key(|(name, address, rank)| (*rank, address.octets(), name.clone()));
+    candidates
+        .into_iter()
+        .map(|(name, address, rank)| NetworkInterface {
+            name,
+            address: address.to_string(),
+            kind: rank.as_kind().into(),
+        })
+        .collect()
+}
+
 /// Every usable local IPv4 address, the one peers should reach us on first.
 pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
-    let mut candidates = Vec::new();
+    let candidates = enumerate_candidates();
+    let ranked: Vec<(Ipv4Addr, AddressRank)> = candidates
+        .iter()
+        .map(|(_, address, rank)| (*address, *rank))
+        .collect();
+    let mut ordered = prefer_lan_addresses(&ranked, default_route_ipv4_address());
 
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            if interface.is_loopback() {
-                continue;
-            }
-
-            let if_addrs::IfAddr::V4(address) = interface.addr else {
-                continue;
-            };
-            if usable_discovery_ipv4(address.ip) {
-                // A /32 is a tunnel endpoint, not a subnet we can broadcast on.
-                let has_subnet = address.netmask != Ipv4Addr::new(255, 255, 255, 255);
-                candidates.push((
-                    address.ip,
-                    classify_address(&interface.name, address.ip, has_subnet),
-                ));
-            }
+    // A pinned interface goes to the front — but only while it actually holds
+    // an address. Otherwise the pin is silently ignored rather than leaving the
+    // machine unreachable, which is what a laptop meets at every new network
+    // where the pinned adapter happens to be down.
+    if let Some(name) = preferred_interface() {
+        if let Some((_, address, _)) = candidates
+            .iter()
+            .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(&name))
+        {
+            ordered.retain(|existing| existing != address);
+            ordered.insert(0, *address);
         }
     }
 
-    prefer_lan_addresses(&candidates, default_route_ipv4_address())
+    ordered
 }
 
 /// Broadcast destinations for discovery, fanned out across the discovery port
@@ -424,6 +515,36 @@ mod tests {
         );
 
         assert_eq!(ordered, vec![wireless, wired]);
+    }
+
+    #[test]
+    fn a_pin_is_ignored_while_its_interface_has_no_address() {
+        // The travelling case: the pinned adapter is down at this stop. Honouring
+        // the pin anyway would announce nothing and leave the machine
+        // unreachable, so the automatic ranking takes over silently.
+        set_preferred_interface(Some("eth0".into()));
+        let present = local_ipv4_interfaces();
+        set_preferred_interface(None);
+
+        // Whatever this machine has, a name that is absent must not appear.
+        assert!(!present.iter().any(|interface| interface.name == "eth0"
+            && interface.address.is_empty()));
+    }
+
+    #[test]
+    fn every_listed_interface_carries_the_rank_the_ui_groups_by() {
+        for interface in local_ipv4_interfaces() {
+            assert!(
+                matches!(
+                    interface.kind.as_str(),
+                    "lan" | "routable" | "virtual" | "tunnel"
+                ),
+                "unexpected kind {:?} for {}",
+                interface.kind,
+                interface.name
+            );
+            assert!(interface.address.parse::<Ipv4Addr>().is_ok());
+        }
     }
 
     #[test]

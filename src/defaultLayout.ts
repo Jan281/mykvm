@@ -35,6 +35,7 @@ export const defaultLayout: LayoutState = {
   edgeSwitchHotkey: 'alt+shift+k',
   edgeLinks: null,
   logLevel: 'info',
+  preferredInterface: null,
   screenSwitchHotkeys: { left: 'alt+left', right: 'alt+right', up: 'alt+up', down: 'alt+down' },
   devices: [
     {
