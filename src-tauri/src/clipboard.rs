@@ -143,6 +143,21 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
+    fn an_empty_or_mismatched_clipboard_keeps_the_handle_open() {
+        // Most polls find nothing new or nothing in the asked-for format. If
+        // that dropped the handle, every poll would reconnect to the compositor
+        // again and the cache would do nothing.
+        assert!(!clipboard_handle_is_broken(&arboard::Error::ContentNotAvailable));
+        assert!(!clipboard_handle_is_broken(&arboard::Error::ConversionFailure));
+
+        // A clipboard that went away has to be reopened on the next poll.
+        assert!(clipboard_handle_is_broken(&arboard::Error::ClipboardNotSupported));
+        assert!(clipboard_handle_is_broken(&arboard::Error::Unknown {
+            description: "compositor restarted".into()
+        }));
+    }
+
+    #[test]
     fn unknown_clipboard_prefers_text_before_image() {
         let content = read_content_for_hint(
             ClipboardContentHint::Unknown,
@@ -197,11 +212,56 @@ mod tests {
     }
 }
 
+/// Runs a read against a clipboard handle kept open on the calling thread.
+///
+/// Reads come from the sync poller, several times a second. On Wayland,
+/// `arboard::Clipboard::new()` opens a compositor connection purely to probe
+/// that data-control works, and the read itself then opens another — so a
+/// fresh handle per poll meant two connections to KWin each time, during
+/// exactly the moments KWin is also streaming the captured pointer. Keeping the
+/// handle removes the probe; the per-read connection lives inside
+/// wl-clipboard-rs and cannot be avoided from here.
+///
+/// The handle is dropped and rebuilt only when an error says the clipboard
+/// itself is gone (a restarted compositor, say). "Nothing in that format" is
+/// the normal answer to most polls and must not cost a reconnect.
+fn with_read_clipboard<T>(
+    read: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, arboard::Error> {
+    thread_local! {
+        static CLIPBOARD: std::cell::RefCell<Option<arboard::Clipboard>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    CLIPBOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(arboard::Clipboard::new()?);
+        }
+        let clipboard = slot.as_mut().expect("clipboard handle was just created");
+        let result = read(clipboard);
+        if let Err(error) = &result {
+            if clipboard_handle_is_broken(error) {
+                *slot = None;
+            }
+        }
+        result
+    })
+}
+
+/// Whether a read error means the handle is unusable, as opposed to the
+/// clipboard simply not holding what was asked for.
+fn clipboard_handle_is_broken(error: &arboard::Error) -> bool {
+    !matches!(
+        error,
+        arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure
+    )
+}
+
 fn read_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    let arboard_image = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
-        let image = clipboard.get_image().ok()?;
+    let arboard_image = with_read_clipboard(|clipboard| clipboard.get_image()).ok().and_then(|image| {
         if image.width == 0 || image.height == 0 || image.bytes.is_empty() {
             return None;
         }
@@ -357,10 +417,7 @@ fn decode_windows_dib_image(data: &[u8]) -> Option<ClipboardImage> {
 /// was the old path and needed a tool no distribution installs by default.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn read_system_text() -> Result<String, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("failed to open clipboard: {error}"))?;
-    clipboard
-        .get_text()
+    with_read_clipboard(|clipboard| clipboard.get_text())
         .map_err(|error| format!("failed to read clipboard text: {error}"))
 }
 

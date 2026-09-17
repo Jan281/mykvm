@@ -444,32 +444,34 @@ fn start_transport(
         // report perfectly good traffic as garbage.
         let Ok(probe) = rmp_serde::from_slice::<StreamProbe>(&payload) else {
             log::debug!("[core] undecodable stream from {from}");
-            return false;
+            return Err("not a packet this build can decode".into());
         };
 
         if probe.protocol == DISCOVERY_PROTOCOL && probe.kind == "pair-confirm" {
             let Ok(packet) = rmp_serde::from_slice::<DiscoveryPacket>(&payload) else {
                 log::warn!("[core] malformed pairing confirmation from {from}");
-                return false;
+                return Err("malformed pairing confirmation".into());
             };
-            return match complete_pairing(&challenge, &membership, &identity_dir, &packet) {
-                Ok(()) => true,
-                Err(error) => {
+            return complete_pairing(&challenge, &membership, &identity_dir, &packet).map_err(
+                |error| {
                     log::warn!("[core] pairing rejected: {error}");
-                    false
-                }
-            };
+                    format!("pairing rejected: {error}")
+                },
+            );
         }
 
         if probe.protocol == CLIPBOARD_PROTOCOL {
-            return accept_clipboard(&clipboard, &membership, &payload, from);
+            // accept_clipboard logs its own reason; the ack stays generic.
+            return accept_clipboard(&clipboard, &membership, &payload, from)
+                .then_some(())
+                .ok_or_else(|| "clipboard refused by the phone".to_string());
         }
 
         // Everything else is acknowledged rather than refused. A refused stream
         // makes the sender drop the QUIC connection, and the next input
         // datagram then pays for re-establishing it.
         log_unsupported_stream(&probe.protocol);
-        true
+        Ok(())
     });
 
     transport::start(

@@ -45,7 +45,22 @@ const MAX_HEALTH_PEERS: usize = 64;
 const MAX_CONCURRENT_STREAMS: usize = 8;
 
 pub type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
-pub type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
+/// Handles one incoming stream. `Err` carries a short reason that travels back
+/// to the sender in the ack, so a refusal can say why instead of arriving as a
+/// bare "reject" that nobody on either side can explain.
+pub type StreamHandler =
+    Arc<dyn Fn(Vec<u8>, SocketAddr) -> Result<(), String> + Send + Sync + 'static>;
+
+/// Prefix of every refusal the transport reports, so callers can tell a peer
+/// that answered "no" from one that could not be reached.
+pub const STREAM_REJECTED_PREFIX: &str = "QUIC stream receiver rejected payload";
+
+/// Whether a send error means the receiver answered and declined, as opposed
+/// to the connection failing. Retrying a refusal is pointless — the same
+/// payload will be declined again — while a transport failure may clear.
+pub fn is_stream_rejection(error: &str) -> bool {
+    error.starts_with(STREAM_REJECTED_PREFIX)
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {
@@ -707,9 +722,14 @@ fn spawn_stream_reader(
                     tokio::spawn(async move {
                         match recv.read_to_end(MAX_STREAM_BYTES).await {
                             Ok(payload) => {
-                                let accepted = on_stream(payload, remote);
-                                let ack: &[u8] = if accepted { b"ok" } else { b"reject" };
-                                let _ = send.write_all(ack).await;
+                                let ack = match on_stream(payload, remote) {
+                                    Ok(()) => b"ok".to_vec(),
+                                    Err(reason) => {
+                                        log::debug!("stream from {remote} refused: {reason}");
+                                        reject_ack(&reason)
+                                    }
+                                };
+                                let _ = send.write_all(&ack).await;
                                 let _ = send.finish();
                             }
                             Err(error) => {
@@ -845,44 +865,83 @@ async fn send_stream_task(
         },
     };
 
-    let result = send_stream_on_connection(connection, payload).await;
-    if result.is_err() {
-        if let Ok(mut map) = connections.lock() {
-            map.remove(&key);
+    match send_stream_on_connection(connection, payload).await {
+        Ok(()) => Ok(()),
+        // The receiver answered. The connection is demonstrably healthy, and it
+        // is the same one input datagrams ride on — dropping it here made every
+        // refused clipboard sync tear down the pointer's connection, so the
+        // next few seconds of mouse movement were discarded while it redialed.
+        Err(StreamSendError::Rejected(reason)) => Err(reason),
+        Err(StreamSendError::Transport(error)) => {
+            if let Ok(mut map) = connections.lock() {
+                map.remove(&key);
+            }
+            Err(error)
         }
     }
-    result
+}
+
+/// Why a stream send failed, split by whether the connection is at fault.
+#[derive(Debug, PartialEq)]
+enum StreamSendError {
+    /// The peer received the payload and declined it.
+    Rejected(String),
+    /// The stream could not be opened, written, or answered.
+    Transport(String),
+}
+
+/// The longest ack `send_stream_on_connection` reads back.
+const MAX_ACK_BYTES: usize = 64;
+
+/// A refusal ack: `reject:` plus as much of the reason as fits.
+fn reject_ack(reason: &str) -> Vec<u8> {
+    let mut ack = String::from("reject:");
+    for character in reason.chars() {
+        if ack.len() + character.len_utf8() > MAX_ACK_BYTES {
+            break;
+        }
+        ack.push(character);
+    }
+    ack.into_bytes()
 }
 
 async fn send_stream_on_connection(
     connection: quinn::Connection,
     payload: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), StreamSendError> {
+    let transport = |message: String| StreamSendError::Transport(message);
     let (mut send, mut recv) = connection
         .open_bi()
         .await
-        .map_err(|error| format!("failed to open QUIC stream: {error}"))?;
+        .map_err(|error| transport(format!("failed to open QUIC stream: {error}")))?;
     send.write_all(&payload)
         .await
-        .map_err(|error| format!("failed to write QUIC stream: {error}"))?;
+        .map_err(|error| transport(format!("failed to write QUIC stream: {error}")))?;
     send.finish()
-        .map_err(|error| format!("failed to finish QUIC stream: {error}"))?;
-    match tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(64)).await {
+        .map_err(|error| transport(format!("failed to finish QUIC stream: {error}")))?;
+    match tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(MAX_ACK_BYTES)).await
+    {
         Ok(Ok(bytes)) => verify_stream_ack(&bytes),
-        Ok(Err(error)) => Err(format!("failed to read QUIC stream ack: {error}")),
-        Err(_) => Err("QUIC stream ack timed out".into()),
+        Ok(Err(error)) => Err(transport(format!("failed to read QUIC stream ack: {error}"))),
+        Err(_) => Err(transport("QUIC stream ack timed out".into())),
     }
 }
 
-fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
+fn verify_stream_ack(bytes: &[u8]) -> Result<(), StreamSendError> {
     if bytes == b"ok" {
-        Ok(())
-    } else {
-        Err(format!(
-            "QUIC stream receiver rejected payload: {}",
-            String::from_utf8_lossy(bytes)
-        ))
+        return Ok(());
     }
+
+    let text = String::from_utf8_lossy(bytes);
+    let reason = match text.strip_prefix("reject:") {
+        Some(reason) if !reason.trim().is_empty() => reason.to_string(),
+        // A peer built before refusals carried a reason.
+        _ if text == "reject" => "no reason given (peer predates reasons)".to_string(),
+        _ => format!("unexpected ack {text:?}"),
+    };
+    Err(StreamSendError::Rejected(format!(
+        "{STREAM_REJECTED_PREFIX}: {reason}"
+    )))
 }
 
 async fn establish_connection(
@@ -1000,7 +1059,10 @@ mod tests {
     #[test]
     fn stream_ack_rejects_non_ok_payloads() {
         assert!(verify_stream_ack(b"ok").is_ok());
-        assert!(verify_stream_ack(b"reject").is_err());
+        assert!(matches!(
+            verify_stream_ack(b"reject"),
+            Err(StreamSendError::Rejected(_))
+        ));
     }
 
     #[test]
@@ -1019,6 +1081,120 @@ mod tests {
     #[test]
     fn quic_runtime_uses_small_worker_pool() {
         assert_eq!(QUIC_WORKER_THREADS, 2);
+    }
+
+    #[test]
+    fn reject_ack_carries_the_reason_within_the_ack_budget() {
+        let ack = reject_ack("clipboard sync is off here");
+        assert_eq!(ack, b"reject:clipboard sync is off here");
+
+        // The sender reads at most MAX_ACK_BYTES; a longer ack would make that
+        // read fail and turn a clean refusal into a transport error.
+        let long = reject_ack(&"x".repeat(200));
+        assert_eq!(long.len(), MAX_ACK_BYTES);
+        assert!(long.starts_with(b"reject:"));
+    }
+
+    #[test]
+    fn a_refusal_reads_back_as_a_rejection_with_its_reason() {
+        let Err(StreamSendError::Rejected(message)) =
+            verify_stream_ack(b"reject:pairing secret does not match")
+        else {
+            panic!("a reject ack must be a rejection, not a transport failure");
+        };
+        assert!(is_stream_rejection(&message));
+        assert!(message.ends_with("pairing secret does not match"), "{message}");
+
+        // A peer built before reasons still counts as a rejection.
+        let Err(StreamSendError::Rejected(legacy)) = verify_stream_ack(b"reject") else {
+            panic!("a bare reject must still be a rejection");
+        };
+        assert!(is_stream_rejection(&legacy));
+        assert!(!is_stream_rejection("QUIC connection to 10.0.0.2:47834 timed out"));
+    }
+
+    /// Two real transports on localhost: the one path through the code where
+    /// the difference between "refused" and "unreachable" actually matters.
+    #[test]
+    fn a_refused_stream_leaves_the_connection_for_the_datagrams_behind_it() {
+        // Regression: any stream error dropped the QUIC connection, including a
+        // clean refusal. Input datagrams share that connection, and while it
+        // redialed they were discarded — so every clipboard copy the other
+        // machine declined froze the remote pointer for a moment, every two
+        // seconds, for as long as control stayed over there.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let base = 52_000 + (std::process::id() % 4_000) as u16 * 2;
+        let dir = |name: &str| {
+            let dir = std::env::temp_dir().join(format!("mykvm-refusal-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            dir
+        };
+
+        let datagrams = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&datagrams);
+        let receiver = start(
+            base,
+            dir("receiver"),
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+            Arc::new(|_, _| Err("clipboard sync is off here".into())),
+        )
+        .expect("receiver starts");
+        let sender = start(
+            base + 1,
+            dir("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| Ok(())),
+        )
+        .expect("sender starts");
+
+        let peer = || {
+            sender.peer(
+                format!("127.0.0.1:{}", receiver.port()),
+                receiver.public_key().to_string(),
+                PROTOCOL_VERSION,
+            )
+        };
+        let arrived_within = |expected: usize| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if datagrams.load(Ordering::SeqCst) >= expected {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+
+        // Establish the connection and prove datagrams flow over it.
+        let refused = sender.send_stream_expect_ack(peer(), b"clipboard".to_vec());
+        let error = refused.expect_err("the receiver declines every stream");
+        assert!(is_stream_rejection(&error), "{error}");
+        assert!(error.ends_with("clipboard sync is off here"), "{error}");
+
+        sender.send_datagram(peer(), b"move".to_vec()).expect("queued");
+        assert!(arrived_within(1), "datagram after the first refusal never arrived");
+
+        // The part that used to fail: refuse again, then send exactly one
+        // datagram. With the connection dropped it would be discarded while
+        // redialing, and nothing would ever arrive.
+        let error = sender
+            .send_stream_expect_ack(peer(), b"clipboard".to_vec())
+            .expect_err("still declined");
+        assert!(is_stream_rejection(&error), "{error}");
+
+        sender.send_datagram(peer(), b"move".to_vec()).expect("queued");
+        assert!(
+            arrived_within(2),
+            "the refusal tore down the connection, so the pointer datagram behind it was lost"
+        );
+
+        sender.shutdown();
+        receiver.shutdown();
+        let _ = fs::remove_dir_all(dir("receiver"));
+        let _ = fs::remove_dir_all(dir("sender"));
     }
 
     #[test]

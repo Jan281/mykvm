@@ -63,9 +63,21 @@ const CLIPBOARD_PROTOCOL: &str = "mykvm.clipboard.v1";
 // it), so a pure content-signature check can ping-pong; this window guarantees
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
+/// How often the clipboard is checked for a new local copy.
+///
+/// Longer on Linux, where every check opens Wayland connections to the same
+/// compositor that is streaming the captured pointer. Half a second is still
+/// quicker than anyone can copy, cross to the other screen and paste — and a
+/// crossing pushes the clipboard immediately regardless of this interval.
+#[cfg(target_os = "linux")]
+const CLIPBOARD_POLL_INTERVAL_MS: u64 = 500;
+#[cfg(not(target_os = "linux"))]
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
+/// How long the same content is left alone after a peer refused it. A new copy
+/// is a new signature and goes out immediately regardless.
+const CLIPBOARD_REFUSED_RETRY_MS: u64 = 60_000;
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
@@ -788,7 +800,7 @@ impl AppRuntime {
                 )
             {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return Ok(());
             }
 
             if handle_pairing_stream_packet(
@@ -800,7 +812,7 @@ impl AppRuntime {
                 &peers_for_pairing,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return Ok(());
             }
 
             // Snapshot the layout instead of holding the lock through the
@@ -811,7 +823,7 @@ impl AppRuntime {
             // of ms per sync. Stream packets are rare; one clone is nothing.
             let layout = {
                 let Ok(layout) = layout_for_clipboard.lock() else {
-                    return false;
+                    return Err("layout lock poisoned".into());
                 };
                 layout.clone()
             };
@@ -825,13 +837,16 @@ impl AppRuntime {
                 &app_handle_for_file_transfer,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return Ok(());
             }
 
+            // Only clipboard is left. Each refusal names its reason: the sender
+            // sees nothing but the ack, so a bare "reject" left both machines
+            // unable to say which of half a dozen checks had failed.
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
-                return false;
+                return Err("clipboard sync is off here".into());
             }
-            if handle_clipboard_packet(
+            match handle_clipboard_packet(
                 &payload,
                 &layout,
                 &current_peer.id,
@@ -839,11 +854,16 @@ impl AppRuntime {
                 &clipboard_echo_until,
                 &clipboard_last_sequences,
             ) {
-                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                clipboard_packets.fetch_add(1, Ordering::Relaxed);
-                return true;
+                Ok(()) => {
+                    transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                    clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(reason) => {
+                    log::warn!("clipboard from {source} refused: {reason}");
+                    Err(reason.into())
+                }
             }
-            false
         });
 
         let identity_dir = self
@@ -4891,7 +4911,9 @@ fn run_clipboard_sync(
     stop: Arc<AtomicBool>,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
-    let mut last_failed: Option<(String, String, String, Instant)> = None;
+    // Device, address, content signature, when it failed, and how long to leave
+    // that same content alone before trying it again.
+    let mut last_failed: Option<(String, String, String, Instant, Duration)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
 
@@ -4944,11 +4966,11 @@ fn run_clipboard_sync(
         }
         if last_failed
             .as_ref()
-            .map(|(device_id, addr, previous, failed_at)| {
+            .map(|(device_id, addr, previous, failed_at, retry_after)| {
                 device_id == &target.device_id
                     && addr == &target.addr
                     && previous == &signature
-                    && failed_at.elapsed() < Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+                    && failed_at.elapsed() < *retry_after
             })
             .unwrap_or(false)
         {
@@ -4996,14 +5018,31 @@ fn run_clipboard_sync(
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
-                if let Err(error) = send_result {
-                    log::warn!("clipboard send failed: {error}");
-                }
+                // A refusal is the peer's considered answer about this exact
+                // content, and asking again returns the same answer. Asking every
+                // two seconds is what kept a capture session busy with a copy the
+                // laptop would never take. An unreachable peer is different: that
+                // can clear, so it keeps the short interval.
+                let retry_after = match &send_result {
+                    Err(error) if quic_transport::is_stream_rejection(error) => {
+                        log::warn!(
+                            "clipboard send refused, not retrying this content for {}s: {error}",
+                            CLIPBOARD_REFUSED_RETRY_MS / 1000
+                        );
+                        Duration::from_millis(CLIPBOARD_REFUSED_RETRY_MS)
+                    }
+                    Err(error) => {
+                        log::warn!("clipboard send failed: {error}");
+                        Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+                    }
+                    Ok(()) => Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS),
+                };
                 last_failed = Some((
                     target.device_id.clone(),
                     target.addr.clone(),
                     signature,
                     Instant::now(),
+                    retry_after,
                 ));
             }
         }
@@ -5069,7 +5108,7 @@ fn handle_clipboard_packet(
     clipboard_seen_text: &Arc<Mutex<Option<String>>>,
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
-) -> bool {
+) -> Result<(), &'static str> {
     handle_clipboard_packet_with_writer(
         payload,
         layout,
@@ -5089,42 +5128,42 @@ fn handle_clipboard_packet_with_writer<F>(
     clipboard_echo_until: &Arc<Mutex<Option<Instant>>>,
     clipboard_last_sequences: &Arc<Mutex<HashMap<String, u64>>>,
     mut write_content: F,
-) -> bool
+) -> Result<(), &'static str>
 where
     F: FnMut(&ClipboardContent) -> Result<(), String>,
 {
     let Some(packet) = decode_wire_packet::<ClipboardPacket>(payload) else {
-        return false;
+        return Err("not a packet this build can decode");
     };
 
     if packet.protocol != CLIPBOARD_PROTOCOL {
-        return false;
+        return Err("not a clipboard packet");
     }
 
-    if !clipboard_packet_authorized(layout, &packet) {
-        return false;
+    if let Some(reason) = clipboard_authorization_failure(layout, &packet) {
+        return Err(reason);
     }
 
     if !clipboard_packet_targets_local(layout, &packet, local_peer_id) {
-        return false;
+        return Err("addressed to another device");
     }
 
     if packet.origin_id == local_peer_id {
-        return true;
+        return Ok(());
     }
 
     if !clipboard_packet_sequence_is_current(&packet, clipboard_last_sequences) {
-        return false;
+        return Err("older than a copy already applied");
     }
 
     let accepted_sequence = clipboard_packet_sequence(&packet);
     let content = clipboard_content_from_packet(packet);
 
     let Some(content) = content else {
-        return false;
+        return Err("no clipboard format this machine can use");
     };
     if content.is_oversized() {
-        return false;
+        return Err("larger than the clipboard size limit");
     }
 
     let signature = content.signature();
@@ -5149,7 +5188,11 @@ where
         arm_clipboard_echo_guard(clipboard_echo_until);
     }
 
-    written
+    if written {
+        Ok(())
+    } else {
+        Err("could not write to the local clipboard")
+    }
 }
 
 fn clipboard_packet_sequence(packet: &ClipboardPacket) -> Option<(String, u64)> {
@@ -5234,12 +5277,24 @@ fn clipboard_content_from_format(format: ClipboardFormat) -> Option<ClipboardCon
 }
 
 fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -> bool {
-    if layout.cluster_id.trim().is_empty()
-        || layout.pair_secret.trim().is_empty()
-        || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
-    {
-        return false;
+    clipboard_authorization_failure(layout, packet).is_none()
+}
+
+/// Which authorization check a clipboard packet fails, if any. Split out so a
+/// refusal can say whether the machines are unpaired, paired into different
+/// clusters, or simply do not recognise each other as controllers.
+fn clipboard_authorization_failure(
+    layout: &LayoutState,
+    packet: &ClipboardPacket,
+) -> Option<&'static str> {
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return Some("this device is not paired");
+    }
+    if packet.cluster_id != layout.cluster_id {
+        return Some("paired into a different cluster");
+    }
+    if packet.pair_secret != layout.pair_secret {
+        return Some("pairing secret does not match");
     }
 
     if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
@@ -5250,15 +5305,16 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
         // though its key was unchanged — which is why input kept working while
         // clipboard from that controller stopped.
         let key = packet.origin_transport_public_key.trim();
-        return layout.paired_controllers.iter().any(|controller| {
+        let known = layout.paired_controllers.iter().any(|controller| {
             (!key.is_empty() && controller.transport_public_key == key)
                 || controller.id == packet.origin_id
         }) || (layout.paired_controllers.len() == 1
             && packet.origin_id == "local-device"
             && !key.is_empty());
+        return (!known).then_some("sender is not a paired controller");
     }
 
-    true
+    None
 }
 
 fn file_transfer_target_for_device(
@@ -8149,7 +8205,7 @@ mod tests {
             },
         );
 
-        assert!(accepted);
+        assert_eq!(accepted, Ok(()));
         assert_eq!(written.as_deref(), Some("hello"));
         assert_eq!(
             clipboard_seen_text.lock().expect("seen lock").as_deref(),
@@ -8190,7 +8246,7 @@ mod tests {
             },
         );
 
-        assert!(accepted);
+        assert_eq!(accepted, Ok(()));
         assert_eq!(written.as_deref(), Some("中文测试 abc 123"));
         assert_eq!(
             clipboard_seen_text.lock().expect("seen lock").as_deref(),
@@ -8235,7 +8291,7 @@ mod tests {
             },
         );
 
-        assert!(accepted);
+        assert_eq!(accepted, Ok(()));
         assert_eq!(written.as_deref(), Some("legacy"));
     }
 
@@ -8314,7 +8370,7 @@ mod tests {
             |_| Err("clipboard busy".into()),
         );
 
-        assert!(!accepted);
+        assert_eq!(accepted, Err("could not write to the local clipboard"));
         assert!(clipboard_seen_text.lock().expect("seen lock").is_none());
     }
 
