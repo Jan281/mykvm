@@ -6172,6 +6172,19 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.upgrading = peer.upgrading;
 }
 
+/// Rebuilds a peer's screens from what it just announced.
+///
+/// Two different things decide a position here, and conflating them is what
+/// made a peer's rearrangement invisible. *Inside* a device, the monitors sit
+/// where that machine's own operating system put them — which is why dragging
+/// moves the whole block and never one screen of it. *Between* devices, the
+/// block's place is the user's arrangement.
+///
+/// So the announced layout is taken as-is and the block is pinned back to
+/// where the user dragged it. Keeping each screen's old position instead froze
+/// the arrangement at the moment a device was first seen: swapping two
+/// monitors over there changed their size and name here but never their
+/// places, and no button could fix it because every path runs through here.
 fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
     if peer.screens.is_empty() {
         return existing_screens.to_vec();
@@ -6189,30 +6202,37 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
-    peer.screens
+
+    let announced: Vec<(String, &LanPeerScreen)> = peer
+        .screens
         .iter()
         .enumerate()
-        .map(|(index, peer_screen)| {
-            let id = unique_peer_screen_id(device_id, peer_screen, index);
-            let existing_screen = existing_screens.iter().find(|screen| screen.id == id);
+        .map(|(index, screen)| (unique_peer_screen_id(device_id, screen, index), screen))
+        .collect();
+
+    let (offset_x, offset_y) =
+        peer_block_offset(existing_screens, &announced, (peer_min_x, peer_min_y));
+
+    announced
+        .iter()
+        .enumerate()
+        .map(|(index, (id, peer_screen))| {
+            let existing_screen = existing_screens.iter().find(|screen| &screen.id == id);
 
             Screen {
-                id,
+                id: id.clone(),
                 device_id: device_id.into(),
                 name: if peer_screen.name.trim().is_empty() {
                     format!("Display {}", index + 1)
                 } else {
                     peer_screen.name.clone()
                 },
+                // How large to draw it is the user's choice, not the system's.
                 board_scale: existing_screen
                     .map(|screen| screen.board_scale)
                     .unwrap_or_else(default_board_scale),
-                x: existing_screen
-                    .map(|screen| screen.x)
-                    .unwrap_or(peer_screen.x - peer_min_x),
-                y: existing_screen
-                    .map(|screen| screen.y)
-                    .unwrap_or(peer_screen.y - peer_min_y),
+                x: offset_x + (peer_screen.x - peer_min_x),
+                y: offset_y + (peer_screen.y - peer_min_y),
                 width: peer_screen.width,
                 height: peer_screen.height,
                 scale: peer_screen.scale,
@@ -6220,6 +6240,52 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
             }
         })
         .collect()
+}
+
+/// Where this device's block of screens sits on the board, so a rearrangement
+/// inside it does not move the block itself.
+///
+/// Measured from the screens that survive the change, so unplugging the
+/// leftmost monitor does not drag everything else sideways. A device nobody
+/// has seen before starts at the origin, as it always has.
+fn peer_block_offset(
+    existing_screens: &[Screen],
+    announced: &[(String, &LanPeerScreen)],
+    peer_min: (i32, i32),
+) -> (i32, i32) {
+    let surviving: Vec<(&Screen, &LanPeerScreen)> = announced
+        .iter()
+        .filter_map(|(id, peer_screen)| {
+            existing_screens
+                .iter()
+                .find(|screen| &screen.id == id)
+                .map(|screen| (screen, *peer_screen))
+        })
+        .collect();
+    if surviving.is_empty() {
+        return (0, 0);
+    }
+
+    let corner = |placed_at: fn(&Screen) -> i32,
+                  reported_at: fn(&LanPeerScreen) -> i32,
+                  min: i32| {
+        let placed = surviving
+            .iter()
+            .map(|(screen, _)| placed_at(screen))
+            .min()
+            .unwrap_or_default();
+        let reported = surviving
+            .iter()
+            .map(|(_, peer_screen)| reported_at(peer_screen) - min)
+            .min()
+            .unwrap_or_default();
+        placed - reported
+    };
+
+    (
+        corner(|screen| screen.x, |screen| screen.x, peer_min.0),
+        corner(|screen| screen.y, |screen| screen.y, peer_min.1),
+    )
 }
 
 fn unique_peer_screen_id(device_id: &str, screen: &LanPeerScreen, index: usize) -> String {
@@ -7396,6 +7462,152 @@ mod tests {
         assert_eq!(adopted.len(), 2);
         assert_eq!((adopted[1].x, adopted[1].y), (1920, 0));
         assert_eq!(adopted[1].board_scale, default_board_scale());
+    }
+
+    fn peer_screen(id: &str, x: i32, y: i32, width: i32, height: i32) -> LanPeerScreen {
+        LanPeerScreen {
+            id: id.into(),
+            name: id.into(),
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0,
+            is_primary: x == 0,
+        }
+    }
+
+    /// The laptop as it announces itself: two monitors side by side, in its own
+    /// coordinates.
+    fn laptop_with(screens: Vec<LanPeerScreen>) -> LanPeer {
+        LanPeer {
+            screens,
+            ..test_peer()
+        }
+    }
+
+    #[test]
+    fn a_peer_that_swaps_its_monitors_swaps_them_here_too() {
+        // Reported from the road: DISPLAY2 moved to the left of DISPLAY3 on the
+        // laptop, and MyKVM kept showing the old order however often the screen
+        // configuration was reloaded. Positions were taken from the existing
+        // entry whenever one was found, so the very first sighting of a device
+        // fixed its internal arrangement for good.
+        let before = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", 0, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 1920, 0, 1920, 1080),
+            ]),
+            "peer-c11",
+            &[],
+        );
+        assert_eq!(before.len(), 2);
+        assert_eq!((before[0].x, before[1].x), (0, 1920));
+
+        let after = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", 1920, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 0, 0, 1920, 1080),
+            ]),
+            "peer-c11",
+            &before,
+        );
+
+        let placed = |name: &str| {
+            after
+                .iter()
+                .find(|screen| screen.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing"))
+                .x
+        };
+        assert_eq!(placed("DISPLAY3"), 0, "DISPLAY3 is on the left now");
+        assert_eq!(placed("DISPLAY2"), 1920, "DISPLAY2 moved to the right");
+    }
+
+    #[test]
+    fn where_the_user_dragged_the_device_survives_the_peers_rearranging() {
+        // The block's place among the other machines is the user's; only the
+        // arrangement inside it belongs to the peer.
+        let dragged: Vec<Screen> = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", 0, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 1920, 0, 1920, 1080),
+            ]),
+            "peer-c11",
+            &[],
+        )
+        .into_iter()
+        .map(|screen| Screen {
+            x: screen.x + 5000,
+            y: screen.y + 300,
+            board_scale: 1.75,
+            ..screen
+        })
+        .collect();
+
+        let after = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", 1920, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 0, 0, 1920, 1080),
+            ]),
+            "peer-c11",
+            &dragged,
+        );
+
+        let screen = |name: &str| {
+            after
+                .iter()
+                .find(|screen| screen.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        assert_eq!((screen("DISPLAY3").x, screen("DISPLAY3").y), (5000, 300));
+        assert_eq!((screen("DISPLAY2").x, screen("DISPLAY2").y), (6920, 300));
+        // Drawing size stays the user's across the rearrangement.
+        assert_eq!(screen("DISPLAY2").board_scale, 1.75);
+    }
+
+    #[test]
+    fn unplugging_the_leftmost_monitor_leaves_the_others_where_they_were() {
+        // The block is pinned by the screens that survive, so losing the one on
+        // the left must not drag the rest sideways.
+        let docked = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", 0, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 1920, 0, 1920, 1080),
+            ]),
+            "peer-c11",
+            &[],
+        );
+        let docked: Vec<Screen> = docked
+            .into_iter()
+            .map(|screen| Screen {
+                x: screen.x + 5000,
+                ..screen
+            })
+            .collect();
+
+        let travelling = screens_from_peer(
+            &laptop_with(vec![peer_screen("DISPLAY3", 0, 0, 1920, 1080)]),
+            "peer-c11",
+            &docked,
+        );
+
+        assert_eq!(travelling.len(), 1);
+        assert_eq!(travelling[0].x, 6920, "DISPLAY3 stayed where it was drawn");
+    }
+
+    #[test]
+    fn a_device_nobody_has_seen_starts_at_the_origin() {
+        let fresh = screens_from_peer(
+            &laptop_with(vec![
+                peer_screen("DISPLAY2", -1920, 0, 1920, 1080),
+                peer_screen("DISPLAY3", 0, 0, 1920, 1080),
+            ]),
+            "peer-new",
+            &[],
+        );
+
+        assert_eq!(fresh.iter().map(|screen| screen.x).min(), Some(0));
     }
 
     fn test_peer() -> LanPeer {
