@@ -4311,29 +4311,45 @@ fn screen_configuration_changed(previous: &[Screen], detected: &[Screen]) -> boo
 
 /// Folds a new display configuration into the layout.
 ///
-/// A screen the user has arranged on the board keeps that arrangement as long
-/// as it is still the same panel — unplugging a second monitor should not shove
-/// the first one somewhere else. Anything new, resized or rescaled takes the
-/// position the operating system reports, since there is nothing of the user's
-/// to preserve for it.
+/// The same split as for a peer's screens: where the monitors sit *relative to
+/// each other* is the operating system's business, and the block's place among
+/// the other machines is the user's — which is why dragging moves a whole
+/// device and never one screen of it.
+///
+/// An earlier version kept each screen's position whenever its size was
+/// unchanged. Swapping two monitors of the same resolution then changed
+/// nothing at all, and because a client announces the screens held in its
+/// layout, the controlling machine kept drawing the old order with no way to
+/// correct it from there.
 fn adopt_detected_screens(current: &[Screen], detected: &[Screen]) -> Vec<Screen> {
+    let min_x = detected.iter().map(|screen| screen.x).min().unwrap_or(0);
+    let min_y = detected.iter().map(|screen| screen.y).min().unwrap_or(0);
+
+    let placed: Vec<(&Screen, (i32, i32))> = detected
+        .iter()
+        .filter_map(|screen| {
+            current
+                .iter()
+                .find(|existing| existing.id == screen.id)
+                .map(|existing| (existing, (screen.x - min_x, screen.y - min_y)))
+        })
+        .collect();
+    // Nothing recognisable to pin to: take the system's own coordinates, which
+    // is what a first run does anyway.
+    let (offset_x, offset_y) = block_offset(&placed, (min_x, min_y));
+
     detected
         .iter()
-        .map(|screen| {
-            let Some(existing) = current.iter().find(|candidate| candidate.id == screen.id) else {
-                return screen.clone();
-            };
-
-            let unchanged = existing.width == screen.width
-                && existing.height == screen.height
-                && existing.scale == screen.scale;
-
-            Screen {
-                board_scale: existing.board_scale,
-                x: if unchanged { existing.x } else { screen.x },
-                y: if unchanged { existing.y } else { screen.y },
-                ..screen.clone()
-            }
+        .map(|screen| Screen {
+            // How large to draw it never comes from the system.
+            board_scale: current
+                .iter()
+                .find(|existing| existing.id == screen.id)
+                .map(|existing| existing.board_scale)
+                .unwrap_or_else(default_board_scale),
+            x: offset_x + (screen.x - min_x),
+            y: offset_y + (screen.y - min_y),
+            ..screen.clone()
         })
         .collect()
 }
@@ -4413,22 +4429,11 @@ fn merge_detected_local_device(saved_layout: &LayoutState, mut detected_device: 
         .iter()
         .find(|device| device.id == detected_device.id)
     {
-        detected_device.screens = detected_device
-            .screens
-            .into_iter()
-            .map(|screen| {
-                saved_device
-                    .screens
-                    .iter()
-                    .find(|saved_screen| saved_screen.id == screen.id)
-                    .map(|saved_screen| Screen {
-                        x: saved_screen.x,
-                        y: saved_screen.y,
-                        ..screen.clone()
-                    })
-                    .unwrap_or(screen)
-            })
-            .collect();
+        // Same rule as while running, so monitors rearranged with the app
+        // closed are picked up on the next launch instead of being overwritten
+        // by where they used to sit.
+        detected_device.screens =
+            adopt_detected_screens(&saved_device.screens, &detected_device.screens);
     }
 
     detected_device
@@ -6210,8 +6215,22 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|(index, screen)| (unique_peer_screen_id(device_id, screen, index), screen))
         .collect();
 
-    let (offset_x, offset_y) =
-        peer_block_offset(existing_screens, &announced, (peer_min_x, peer_min_y));
+    let placed: Vec<(&Screen, (i32, i32))> = announced
+        .iter()
+        .filter_map(|(id, peer_screen)| {
+            existing_screens
+                .iter()
+                .find(|screen| &screen.id == id)
+                .map(|screen| {
+                    (
+                        screen,
+                        (peer_screen.x - peer_min_x, peer_screen.y - peer_min_y),
+                    )
+                })
+        })
+        .collect();
+    // A device nobody has seen before starts at the origin, as it always has.
+    let (offset_x, offset_y) = block_offset(&placed, (0, 0));
 
     announced
         .iter()
@@ -6242,49 +6261,36 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .collect()
 }
 
-/// Where this device's block of screens sits on the board, so a rearrangement
-/// inside it does not move the block itself.
+/// Where a device's block of screens sits, so a rearrangement inside it does
+/// not move the block itself.
 ///
-/// Measured from the screens that survive the change, so unplugging the
-/// leftmost monitor does not drag everything else sideways. A device nobody
-/// has seen before starts at the origin, as it always has.
-fn peer_block_offset(
-    existing_screens: &[Screen],
-    announced: &[(String, &LanPeerScreen)],
-    peer_min: (i32, i32),
-) -> (i32, i32) {
-    let surviving: Vec<(&Screen, &LanPeerScreen)> = announced
-        .iter()
-        .filter_map(|(id, peer_screen)| {
-            existing_screens
-                .iter()
-                .find(|screen| &screen.id == id)
-                .map(|screen| (screen, *peer_screen))
-        })
-        .collect();
-    if surviving.is_empty() {
-        return (0, 0);
+/// `placed` pairs each screen that survives the change with the position its
+/// own machine now reports for it, relative to that machine's top-left corner.
+/// The offset is taken from the surviving screens only, so unplugging the
+/// leftmost monitor does not drag the rest sideways. With nothing to go on,
+/// `fallback` decides where the block lands.
+fn block_offset(placed: &[(&Screen, (i32, i32))], fallback: (i32, i32)) -> (i32, i32) {
+    if placed.is_empty() {
+        return fallback;
     }
 
-    let corner = |placed_at: fn(&Screen) -> i32,
-                  reported_at: fn(&LanPeerScreen) -> i32,
-                  min: i32| {
-        let placed = surviving
+    let corner = |here: fn(&Screen) -> i32, reported: fn(&(i32, i32)) -> i32| {
+        let drawn = placed
             .iter()
-            .map(|(screen, _)| placed_at(screen))
+            .map(|(screen, _)| here(screen))
             .min()
             .unwrap_or_default();
-        let reported = surviving
+        let announced = placed
             .iter()
-            .map(|(_, peer_screen)| reported_at(peer_screen) - min)
+            .map(|(_, position)| reported(position))
             .min()
             .unwrap_or_default();
-        placed - reported
+        drawn - announced
     };
 
     (
-        corner(|screen| screen.x, |screen| screen.x, peer_min.0),
-        corner(|screen| screen.y, |screen| screen.y, peer_min.1),
+        corner(|screen| screen.x, |position| position.0),
+        corner(|screen| screen.y, |position| position.1),
     )
 }
 
@@ -7433,21 +7439,71 @@ mod tests {
     }
 
     #[test]
-    fn a_resized_screen_takes_the_position_the_system_reports() {
-        // Nothing of the user's is worth preserving for a panel that changed
-        // resolution: their arrangement was built around the old size.
-        let arranged = vec![Screen {
-            x: 4000,
-            y: 300,
-            board_scale: 1.75,
-            ..detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)
-        }];
-        let detected = vec![detected_screen("local-display-1", "DP-1", 0, 0, 3840, 2160)];
+    fn a_resized_screen_keeps_the_block_but_follows_the_system_inside_it() {
+        // Behaviour change: this used to snap a resized panel back to the
+        // system's own coordinates, discarding the user's placement. Nothing
+        // about a changed resolution says the device block should jump — only
+        // the arrangement *inside* the block comes from the system.
+        let arranged = vec![
+            Screen {
+                x: 4000,
+                y: 300,
+                board_scale: 1.75,
+                ..detected_screen("local-display-1", "DP-1", 0, 0, 1920, 1080)
+            },
+            Screen {
+                x: 5920,
+                y: 300,
+                ..detected_screen("local-display-2", "DP-2", 1920, 0, 1920, 1080)
+            },
+        ];
+        // DP-1 is now 4K, so DP-2 sits further right in the system's layout.
+        let detected = vec![
+            detected_screen("local-display-1", "DP-1", 0, 0, 3840, 2160),
+            detected_screen("local-display-2", "DP-2", 3840, 0, 1920, 1080),
+        ];
 
         let adopted = adopt_detected_screens(&arranged, &detected);
-        assert_eq!((adopted[0].x, adopted[0].y), (0, 0));
+
+        assert_eq!((adopted[0].x, adopted[0].y), (4000, 300), "the block stayed put");
+        assert_eq!(adopted[1].x, 7840, "DP-2 moved with the wider panel");
         // The drawing preference is still the user's, whatever the size.
         assert_eq!(adopted[0].board_scale, 1.75);
+    }
+
+    #[test]
+    fn two_identical_monitors_swapping_places_is_adopted() {
+        // The reported bug, on the side that announces: both panels are
+        // 1920x1080, so the old rule called the configuration "unchanged" and
+        // kept the stale order — which the client then announced, leaving the
+        // controlling machine drawing it the wrong way round.
+        let arranged = vec![
+            Screen {
+                x: 5000,
+                ..detected_screen("local-display-2", "\\\\.\\DISPLAY2", 0, 0, 1920, 1080)
+            },
+            Screen {
+                x: 6920,
+                ..detected_screen("local-display-3", "\\\\.\\DISPLAY3", 1920, 0, 1920, 1080)
+            },
+        ];
+        // Windows now reports DISPLAY2 on the right and DISPLAY3 on the left.
+        let detected = vec![
+            detected_screen("local-display-2", "\\\\.\\DISPLAY2", 1920, 0, 1920, 1080),
+            detected_screen("local-display-3", "\\\\.\\DISPLAY3", 0, 0, 1920, 1080),
+        ];
+
+        let adopted = adopt_detected_screens(&arranged, &detected);
+        let at = |id: &str| {
+            adopted
+                .iter()
+                .find(|screen| screen.id == id)
+                .unwrap_or_else(|| panic!("{id} is missing"))
+                .x
+        };
+
+        assert_eq!(at("local-display-3"), 5000, "DISPLAY3 is on the left now");
+        assert_eq!(at("local-display-2"), 6920, "DISPLAY2 moved to the right");
     }
 
     #[test]
