@@ -37,7 +37,7 @@ use std::{
     io::Write,
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::PathBuf,
-    sync::{mpsc, OnceLock},
+    sync::{mpsc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -114,7 +114,32 @@ enum Command {
 /// `CaptureService`: creating it lazily per-connection would mean the
 /// permission prompt lands at some arbitrary later moment instead of
 /// predictably, close to when receive mode actually turns on.
-static SERVICE: OnceLock<Result<InjectService, String>> = OnceLock::new();
+static READY: OnceLock<InjectService> = OnceLock::new();
+
+/// The session while the portal is still negotiating it. Same reasoning as
+/// `linux_input`'s: a caller that stopped waiting must not leave the session
+/// behind, and must not turn a pending dialog into a permanent error.
+static STARTUP: Mutex<Startup> = Mutex::new(Startup::NotStarted);
+
+/// Short on purpose — see `linux_input::FIRST_WAIT`.
+const FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// One attempt per watcher tick; see `linux_input::RETRY_WAIT`.
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+
+const AWAITING_PORTAL: &str = "MyKVM is waiting for the RemoteDesktop portal to hand over an input session. If a permission dialog is open, allow it and injection starts on its own — no need to restart MyKVM. If no dialog appeared, xdg-desktop-portal needs a backend that implements RemoteDesktop (KDE Plasma 6.1+ or GNOME 46+).";
+
+enum Startup {
+    NotStarted,
+    Waiting(PendingService),
+    Failed(String),
+    Done,
+}
+
+struct PendingService {
+    command_tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    ready_rx: mpsc::Receiver<Result<(), String>>,
+}
 
 /// Set once if the compositor/portal refuses the RemoteDesktop grant, so a
 /// later status poll can surface it without re-prompting — the same
@@ -170,10 +195,70 @@ fn store_restore_token(token: Option<&str>) {
 }
 
 pub fn service() -> Result<&'static InjectService, String> {
-    SERVICE
-        .get_or_init(InjectService::start)
-        .as_ref()
-        .map_err(|error| error.clone())
+    if let Some(service) = READY.get() {
+        return Ok(service);
+    }
+
+    let mut startup = STARTUP
+        .lock()
+        .map_err(|_| "the injection startup state is poisoned".to_string())?;
+
+    if let Some(service) = READY.get() {
+        return Ok(service);
+    }
+
+    let (pending, wait) = match std::mem::replace(&mut *startup, Startup::Done) {
+        Startup::NotStarted => (InjectService::spawn(), FIRST_WAIT),
+        Startup::Waiting(pending) => (pending, RETRY_WAIT),
+        Startup::Failed(error) => {
+            *startup = Startup::Failed(error.clone());
+            return Err(error);
+        }
+        Startup::Done => {
+            let error = "the remote-desktop portal session is gone".to_string();
+            *startup = Startup::Failed(error.clone());
+            return Err(error);
+        }
+    };
+
+    let ready = wait_once(&mut startup, pending, wait)?;
+    Ok(READY.get_or_init(|| InjectService {
+        command_tx: ready.command_tx,
+    }))
+}
+
+/// See `linux_input::wait_once`: a timeout keeps the pending session, nothing
+/// else does.
+fn wait_once(
+    startup: &mut Startup,
+    pending: PendingService,
+    wait: Duration,
+) -> Result<PendingService, String> {
+    match pending.ready_rx.recv_timeout(wait) {
+        Ok(Ok(())) => Ok(pending),
+        Ok(Err(error)) => {
+            *startup = Startup::Failed(error.clone());
+            Err(error)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            *startup = Startup::Waiting(pending);
+            Err(AWAITING_PORTAL.to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let error = "the remote-desktop portal thread stopped without opening a session".to_string();
+            *startup = Startup::Failed(error.clone());
+            Err(error)
+        }
+    }
+}
+
+/// True exactly while the portal has not answered yet, so the watcher in
+/// `lib.rs` knows to come back instead of leaving a granted session unused.
+pub fn awaiting_permission() -> bool {
+    STARTUP
+        .lock()
+        .map(|startup| matches!(*startup, Startup::Waiting(_)))
+        .unwrap_or(false)
 }
 
 pub fn denial_reason() -> Option<String> {
@@ -185,7 +270,9 @@ pub struct InjectService {
 }
 
 impl InjectService {
-    fn start() -> Result<Self, String> {
+    /// Starts the portal thread and hands the pieces back without waiting;
+    /// [`service`] owns the waiting, so a slow dialog never becomes an error.
+    fn spawn() -> PendingService {
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
 
@@ -204,10 +291,9 @@ impl InjectService {
             runtime.block_on(service_loop(command_rx, ready_tx));
         });
 
-        match ready_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(())) => Ok(Self { command_tx }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err("The RemoteDesktop portal did not respond. It needs xdg-desktop-portal with a backend that implements RemoteDesktop (KDE Plasma 6.1+ or GNOME 46+).".into()),
+        PendingService {
+            command_tx,
+            ready_rx,
         }
     }
 
@@ -690,6 +776,34 @@ async fn sync_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirror of `linux_input`'s: a portal that has not answered yet leaves
+    /// the session pending, so a later grant is still picked up.
+    #[test]
+    fn an_unanswered_portal_keeps_the_session_pending() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut startup = Startup::NotStarted;
+
+        let error = wait_once(
+            &mut startup,
+            PendingService { command_tx, ready_rx },
+            Duration::from_millis(10),
+        )
+        .err()
+        .expect("the portal has not answered yet");
+        assert_eq!(error, AWAITING_PORTAL);
+        assert!(matches!(startup, Startup::Waiting(_)));
+
+        ready_tx.send(Ok(())).expect("the waiter still holds the channel");
+        let Startup::Waiting(pending) = std::mem::replace(&mut startup, Startup::Done) else {
+            panic!("the session should still be pending");
+        };
+        assert!(
+            wait_once(&mut startup, pending, Duration::from_millis(10)).is_ok(),
+            "the answered session is usable"
+        );
+    }
 
     #[test]
     fn windows_vk_to_evdev_round_trips_through_the_forward_table() {

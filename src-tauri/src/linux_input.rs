@@ -334,20 +334,130 @@ impl ScrollState {
     }
 }
 
-/// The one portal session for this process.
+/// The one portal session for this process, once the portal has confirmed it.
 ///
 /// Held for the lifetime of the app rather than per capture run: creating it is
 /// what prompts the user for permission, and a second concurrent session stops
 /// the compositor from arming barriers at all.
-static SERVICE: OnceLock<Result<CaptureService, String>> = OnceLock::new();
+static READY: OnceLock<CaptureService> = OnceLock::new();
+
+/// The session while it is still being negotiated, so a caller that stopped
+/// waiting does not leave it behind and open a second one later.
+static STARTUP: Mutex<Startup> = Mutex::new(Startup::NotStarted);
+
+/// How long the very first call waits for the portal. Deliberately short: it
+/// runs during app startup, and if the portal has to ask the user, the answer
+/// is a human away — seconds of blocking buy nothing and delay the window.
+const FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// How long every later call waits. The watcher in `lib.rs` comes back once a
+/// second while a session is pending, so this only has to be long enough to
+/// collect an answer, not to stall that tick.
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+
+const AWAITING_PERMISSION: &str = "MyKVM is waiting for the compositor's input-capture permission dialog. Allow it and capture arms itself — no need to restart MyKVM. If no dialog appeared, xdg-desktop-portal needs a backend that implements InputCapture (KDE Plasma 6.1+ or GNOME 46+).";
+
+enum Startup {
+    NotStarted,
+    /// The portal thread is running and has not reported back yet.
+    Waiting(PendingService),
+    /// Reported something that waiting longer cannot fix.
+    Failed(String),
+    /// Negotiated; the service itself lives in `READY`.
+    Done,
+}
+
+/// Everything `CaptureService` is made of, kept aside until the portal
+/// confirms the session.
+struct PendingService {
+    command_tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    handler: Arc<Mutex<Option<EventHandler>>>,
+    ready_rx: mpsc::Receiver<Result<(), String>>,
+}
 
 /// Returns the process-wide capture service, opening the portal session on the
 /// first call.
+///
+/// A session that is merely waiting for the user is **not** a failure that
+/// sticks. Giving up on the wait used to store the timeout in a `OnceLock`, so
+/// pressing "Allow" afterwards changed nothing and only restarting MyKVM
+/// helped — the autostart case, where the dialog can sit unanswered through the
+/// whole login. The pending session is kept instead and the next call waits on
+/// the same answer.
 pub fn service() -> Result<&'static CaptureService, String> {
-    SERVICE
-        .get_or_init(CaptureService::start)
-        .as_ref()
-        .map_err(|error| error.clone())
+    if let Some(service) = READY.get() {
+        return Ok(service);
+    }
+
+    let mut startup = STARTUP
+        .lock()
+        .map_err(|_| "the capture startup state is poisoned".to_string())?;
+
+    // Another caller may have finished the negotiation while we waited here.
+    if let Some(service) = READY.get() {
+        return Ok(service);
+    }
+
+    let (pending, wait) = match std::mem::replace(&mut *startup, Startup::Done) {
+        Startup::NotStarted => (CaptureService::spawn(), FIRST_WAIT),
+        Startup::Waiting(pending) => (pending, RETRY_WAIT),
+        Startup::Failed(error) => {
+            *startup = Startup::Failed(error.clone());
+            return Err(error);
+        }
+        // Unreachable: `Done` is only left behind once `READY` is set, which
+        // the check above already returned on.
+        Startup::Done => {
+            let error = "the capture portal session is gone".to_string();
+            *startup = Startup::Failed(error.clone());
+            return Err(error);
+        }
+    };
+
+    let ready = wait_once(&mut startup, pending, wait)?;
+    Ok(READY.get_or_init(|| CaptureService {
+        command_tx: ready.command_tx,
+        handler: ready.handler,
+        generation: AtomicU64::new(0),
+    }))
+}
+
+/// Waits once for the portal and records what came of it.
+///
+/// Split out of [`service`] so the outcomes can be checked without a portal:
+/// everything hinges on a timeout leaving the session pending rather than
+/// burning it, and on nothing else doing so.
+fn wait_once(
+    startup: &mut Startup,
+    pending: PendingService,
+    wait: Duration,
+) -> Result<PendingService, String> {
+    match pending.ready_rx.recv_timeout(wait) {
+        Ok(Ok(())) => Ok(pending),
+        Ok(Err(error)) => {
+            *startup = Startup::Failed(error.clone());
+            Err(error)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            *startup = Startup::Waiting(pending);
+            Err(AWAITING_PERMISSION.to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let error = "the capture portal thread stopped without opening a session".to_string();
+            *startup = Startup::Failed(error.clone());
+            Err(error)
+        }
+    }
+}
+
+/// Whether the portal session is still being negotiated — true exactly while a
+/// permission dialog sits unanswered, which is what makes the watcher in
+/// `lib.rs` come back and try again.
+pub fn awaiting_permission() -> bool {
+    STARTUP
+        .lock()
+        .map(|startup| matches!(*startup, Startup::Waiting(_)))
+        .unwrap_or(false)
 }
 
 /// Handles capture events while armed. Swapped out on every re-arm, because
@@ -386,10 +496,10 @@ impl CaptureService {
     /// Opens the portal session — and so triggers the permission prompt — then
     /// keeps it on a dedicated thread until [`shutdown`](Self::shutdown).
     ///
-    /// Returns once the session is usable, so a caller can report a meaningful
-    /// status; it does not wait for the user to answer the prompt, since KDE
-    /// grants the session first and asks on the first activation.
-    pub fn start() -> Result<Self, String> {
+    /// Hands the pieces back right away; [`service`] decides how long to wait
+    /// for the portal to confirm the session, because that wait is a user
+    /// reading a dialog and must stay interruptible.
+    fn spawn() -> PendingService {
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let handler: Arc<Mutex<Option<EventHandler>>> = Arc::new(Mutex::new(None));
@@ -410,14 +520,10 @@ impl CaptureService {
             runtime.block_on(service_loop(command_rx, thread_handler, ready_tx));
         });
 
-        match ready_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(())) => Ok(Self {
-                command_tx,
-                handler,
-                generation: AtomicU64::new(0),
-            }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err("The InputCapture portal did not respond. It needs xdg-desktop-portal with a backend that implements InputCapture (KDE Plasma 6.1+ or GNOME 46+).".into()),
+        PendingService {
+            command_tx,
+            handler,
+            ready_rx,
         }
     }
 
@@ -855,6 +961,89 @@ fn translate_ei_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_with(
+        ready_rx: mpsc::Receiver<Result<(), String>>,
+    ) -> PendingService {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
+        PendingService {
+            command_tx,
+            handler: Arc::new(Mutex::new(None)),
+            ready_rx,
+        }
+    }
+
+    /// The autostart case: the permission dialog is still on screen when the
+    /// first wait runs out. Before, the timeout was cached and pressing
+    /// "Allow" afterwards changed nothing until MyKVM was restarted.
+    #[test]
+    fn an_unanswered_dialog_keeps_the_session_pending() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut startup = Startup::NotStarted;
+
+        let error = wait_once(
+            &mut startup,
+            pending_with(ready_rx),
+            Duration::from_millis(10),
+        )
+        .err()
+        .expect("the portal has not answered yet");
+        assert_eq!(error, AWAITING_PERMISSION);
+        assert!(matches!(startup, Startup::Waiting(_)));
+        assert!(
+            !matches!(startup, Startup::Failed(_)),
+            "a pending dialog must never become a permanent failure"
+        );
+
+        // The user answers, the next call picks the same session back up.
+        ready_tx.send(Ok(())).expect("the waiter still holds the channel");
+        let Startup::Waiting(pending) = std::mem::replace(&mut startup, Startup::Done) else {
+            panic!("the session should still be pending");
+        };
+        assert!(
+            wait_once(&mut startup, pending, Duration::from_millis(10)).is_ok(),
+            "the answered session is usable"
+        );
+    }
+
+    #[test]
+    fn a_portal_that_reports_a_problem_is_not_retried() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        ready_tx
+            .send(Err("InputCapture portal unavailable".into()))
+            .expect("the receiver is alive");
+        let mut startup = Startup::NotStarted;
+
+        let error = wait_once(
+            &mut startup,
+            pending_with(ready_rx),
+            Duration::from_millis(10),
+        )
+        .err()
+        .expect("the portal said no");
+        assert_eq!(error, "InputCapture portal unavailable");
+        assert!(matches!(startup, Startup::Failed(_)));
+    }
+
+    /// A thread that died without a word must not look like an open dialog, or
+    /// the watcher would poll it once a second forever.
+    #[test]
+    fn a_thread_that_vanished_is_a_failure_not_a_pending_dialog() {
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        drop(ready_tx);
+        let mut startup = Startup::NotStarted;
+
+        assert!(
+            wait_once(
+                &mut startup,
+                pending_with(ready_rx),
+                Duration::from_millis(10),
+            )
+            .is_err(),
+            "nobody will answer"
+        );
+        assert!(matches!(startup, Startup::Failed(_)));
+    }
 
     #[test]
     fn apostrophe_maps_to_oem_7_so_dead_keys_survive() {

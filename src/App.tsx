@@ -601,9 +601,19 @@ function App() {
                   : null;
 
             if (reason !== reportedRuntimeErrorRef.current) {
+              const resolved = reportedRuntimeErrorRef.current;
               reportedRuntimeErrorRef.current = reason;
               if (reason) {
                 setErrorMessage(reason);
+              } else if (resolved) {
+                // A condition that cleared itself should take its message with
+                // it: the portal's permission prompt is reported this way, and
+                // leaving "waiting for permission" on screen after the user
+                // allowed it reads as if allowing had not worked. Only our own
+                // message is withdrawn, never one from somewhere else.
+                setErrorMessage((current) =>
+                  current === resolved ? null : current,
+                );
               }
             }
           }

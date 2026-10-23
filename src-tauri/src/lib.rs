@@ -1317,6 +1317,55 @@ impl AppRuntime {
         true
     }
 
+    /// Picks a portal session up once the user has answered its permission
+    /// dialog.
+    ///
+    /// The dialogs can sit unanswered for as long as it takes someone to
+    /// notice them — on autostart, through the whole login. Nothing else here
+    /// would ask again: `rearm_input_if_wiring_changed` only reacts to the
+    /// wiring changing, and the wiring is the same as it was. So while a
+    /// session is pending this gives the portal one short attempt per tick,
+    /// and re-runs the input stage the moment the last one resolves.
+    #[cfg(target_os = "linux")]
+    fn settle_pending_portals(&self) -> bool {
+        if !(crate::linux_input::awaiting_permission() || crate::linux_inject::awaiting_permission()) {
+            return false;
+        }
+
+        // Only while input is meant to be running; starting it from here would
+        // undo a stop the user asked for.
+        let running = self
+            .input_stop
+            .lock()
+            .map(|stop| stop.is_some())
+            .unwrap_or(false);
+        if !running {
+            return false;
+        }
+
+        // Each call waits only briefly, so a tick is never stalled for long.
+        let _ = crate::linux_input::service();
+        let _ = crate::linux_inject::service();
+
+        if crate::linux_input::awaiting_permission() || crate::linux_inject::awaiting_permission() {
+            return false;
+        }
+
+        log::info!("portal permission settled; restarting the input stage");
+        let layout = self.layout_snapshot();
+        let (capture, inject) = self.start_input(layout);
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.capture = capture;
+            runtime.inject = inject;
+        }
+        true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn settle_pending_portals(&self) -> bool {
+        false
+    }
+
     fn rearm_input_if_wiring_changed(&self) -> bool {
         let layout = self.layout_snapshot();
         if layout.input_mode == "receive" {
@@ -3211,7 +3260,9 @@ pub fn run() {
                                 state.inner().refresh_local_screens_if_changed();
                             }
 
-                            if state.inner().rearm_input_if_wiring_changed() {
+                            if state.inner().settle_pending_portals()
+                                || state.inner().rearm_input_if_wiring_changed()
+                            {
                                 if let Ok(runtime) = state.inner().runtime.lock() {
                                     notify_runtime_state_changed(&handle, &runtime);
                                 }
