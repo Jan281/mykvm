@@ -989,13 +989,19 @@ function App() {
   }
 
   const sendDroppedFiles = useEffectEvent(
-    async (targetDeviceId: string, paths: string[]) => {
+    async (targetDeviceId: string | null, paths: string[]) => {
       if (snapshotRef.current?.layout.fileTransferEnabled === false) {
+        setErrorMessage(ui.errors.fileTransferOff);
         return;
       }
 
       const transferPaths = paths.filter((path) => path.trim().length > 0);
       if (transferPaths.length === 0) {
+        return;
+      }
+
+      if (!targetDeviceId) {
+        setErrorMessage(ui.errors.fileTransferNoTarget);
         return;
       }
 
@@ -1035,7 +1041,7 @@ function App() {
         if (payload.type === "over") {
           setFileDragTargetId(
             fileTransferTargetIdAtPosition(
-              payload.position,
+              cssPositionFromPhysical(payload.position),
               fileTransferFallbackTargetIdRef.current,
             ),
           );
@@ -1045,12 +1051,15 @@ function App() {
         if (payload.type === "drop") {
           const targetDeviceId =
             fileTransferTargetIdAtPosition(
-              payload.position,
+              cssPositionFromPhysical(payload.position),
               fileTransferFallbackTargetIdRef.current,
             ) ??
             fileDragTargetIdRef.current;
           setFileDragTargetId(null);
-          if (targetDeviceId && payload.paths?.length) {
+          if (payload.paths?.length) {
+            // Also when nothing was hit: a drop that lands beside every target
+            // used to do nothing at all, which is indistinguishable from a
+            // transfer that failed somewhere on the wire.
             void sendDroppedFiles(targetDeviceId, payload.paths);
           }
           return;
@@ -4480,6 +4489,22 @@ function formatScreenCount(count: number, language: AppLanguage) {
     return `${count} ${count === 1 ? "Bildschirm" : "Bildschirme"}`;
   }
   return `${count} ${count === 1 ? "screen" : "screens"}`;
+}
+
+/**
+ * Tauri reports drop coordinates in physical device pixels, while
+ * `document.elementFromPoint` reads CSS pixels. The two only agree at a scale
+ * factor of 1 — on a scaled display the hit test looked for the drop target
+ * well below and to the right of where the file was actually dropped, found
+ * nothing, and the drop was silently discarded.
+ */
+function cssPositionFromPhysical(position?: FileDropPosition | null) {
+  if (!position) {
+    return null;
+  }
+
+  const ratio = window.devicePixelRatio || 1;
+  return { x: position.x / ratio, y: position.y / ratio };
 }
 
 function fileTransferTargetIdAtPosition(

@@ -258,6 +258,9 @@ export const TEXT = {
       pairingCodeRequired: "请输入客户端显示的 6 位验证码。",
       pairingFailed: "配对失败。",
       fileTransfer: "文件传输失败。",
+      fileTransferNoTarget:
+        "这里没有接收目标：请把文件拖到某台在线且已就绪的设备屏幕上。",
+      fileTransferOff: "文件传输已关闭。",
       writeClipboard: "写入剪贴板失败。",
       checkUpdate: "检查更新失败。",
       installUpdate: "下载安装更新失败。",
@@ -529,6 +532,9 @@ export const TEXT = {
       pairingCodeRequired: "Enter the 6-digit code shown on the client.",
       pairingFailed: "Pairing failed.",
       fileTransfer: "File transfer failed.",
+      fileTransferNoTarget:
+        "Nothing here to send to. Drop the files onto the screen of a device that is online and ready.",
+      fileTransferOff: "File transfer is switched off.",
       writeClipboard: "Failed to write clipboard.",
       checkUpdate: "Failed to check for updates.",
       installUpdate: "Failed to download and install the update.",
@@ -806,6 +812,9 @@ export const TEXT = {
         "Gib den 6-stelligen Code ein, der auf dem Client angezeigt wird.",
       pairingFailed: "Kopplung fehlgeschlagen.",
       fileTransfer: "Dateiübertragung fehlgeschlagen.",
+      fileTransferNoTarget:
+        "Hier gibt es kein Ziel. Lass die Dateien auf dem Bildschirm eines Geräts fallen, das online und bereit ist.",
+      fileTransferOff: "Dateiübertragung ist ausgeschaltet.",
       writeClipboard: "Zwischenablage konnte nicht beschrieben werden.",
       checkUpdate: "Suche nach Updates fehlgeschlagen.",
       installUpdate:
